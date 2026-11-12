@@ -21,7 +21,7 @@ const {
   phaseLabel,
 } = require('../.tmp/js/features/squat/squatCounter.js')
 
-const { angleAt, kneeAngleFromPose, POSE } = require('../.tmp/js/features/squat/poseMath.js')
+const { angleAt, kneeAngleFromPose, legLooksComplete, POSE } = require('../.tmp/js/features/squat/poseMath.js')
 
 const cfg = DEFAULT_SQUAT_CONFIG
 
@@ -240,4 +240,53 @@ test('kneeAngleFromPose：缺关键点时安全返回 null（不抛异常）', (
   const r = kneeAngleFromPose([])
   assert.equal(r.angle, null)
   assert.equal(r.side, null)
+})
+
+// ---------------------------------------------------------------- 取景校验
+// 这些用例来自实测录屏：摄像头只拍到上半身时，MediaPipe 仍会外推出膝/踝，
+// 于是膝角照样算得出来但完全是假的。legLooksComplete 就是挡这种情况的。
+
+function legPose(hip, knee, ankle, vis = 0.9) {
+  const lms = Array.from({ length: 33 }, () => ({ x: 0.5, y: 0.5, visibility: 0 }))
+  lms[POSE.leftHip] = { x: hip[0], y: hip[1], visibility: vis }
+  lms[POSE.leftKnee] = { x: knee[0], y: knee[1], visibility: vis }
+  lms[POSE.leftAnkle] = { x: ankle[0], y: ankle[1], visibility: vis }
+  return lms
+}
+
+test('legLooksComplete：全身入画 → 判定可用', () => {
+  const r = legLooksComplete(legPose([0.5, 0.45], [0.5, 0.65], [0.5, 0.85]))
+  assert.equal(r.ok, true)
+  assert.equal(r.side, 'left')
+})
+
+test('legLooksComplete：脚踝贴画面底边（被裁）→ 不可用', () => {
+  const r = legLooksComplete(legPose([0.5, 0.5], [0.5, 0.7], [0.5, 0.995]))
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /看不到完整的腿/)
+})
+
+test('legLooksComplete：膝盖跑到髋上方（解剖上反了）→ 不可用', () => {
+  const r = legLooksComplete(legPose([0.5, 0.6], [0.5, 0.3], [0.5, 0.85]))
+  assert.equal(r.ok, false)
+})
+
+test('legLooksComplete：腿在画面里太短（没拍全）→ 不可用', () => {
+  const r = legLooksComplete(legPose([0.5, 0.45], [0.5, 0.48], [0.5, 0.50]))
+  assert.equal(r.ok, false)
+})
+
+test('legLooksComplete：可见度过低 → 不可用', () => {
+  const r = legLooksComplete(legPose([0.5, 0.45], [0.5, 0.65], [0.5, 0.85], 0.2))
+  assert.equal(r.ok, false)
+})
+
+test('legLooksComplete：两条腿都完整 → side=both', () => {
+  const lms = legPose([0.5, 0.45], [0.5, 0.65], [0.5, 0.85])
+  lms[POSE.rightHip] = { x: 0.45, y: 0.45, visibility: 0.9 }
+  lms[POSE.rightKnee] = { x: 0.45, y: 0.65, visibility: 0.9 }
+  lms[POSE.rightAnkle] = { x: 0.45, y: 0.85, visibility: 0.9 }
+  const r = legLooksComplete(lms)
+  assert.equal(r.ok, true)
+  assert.equal(r.side, 'both')
 })

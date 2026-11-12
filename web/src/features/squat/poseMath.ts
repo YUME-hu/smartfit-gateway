@@ -48,6 +48,101 @@ export interface KneeAngleResult {
   side: 'left' | 'right' | 'both' | null
 }
 
+/**
+ * 腿部是否"完整且可信"地出现在画面里
+ *
+ * 为什么需要它（这是实测录屏暴露出来的）：
+ *   当摄像头只拍到上半身时，MediaPipe **仍然会输出膝/踝关键点**（外推到画外），
+ *   visibility 也可能高于 0.5。于是膝角照样算得出来，但那是编的。
+ *   实测现象：只拍到腰的人，界面照样显示 87° 并计了数 —— 数据是假的。
+ *
+ * 这里用三个几何约束做"物理合理性"校验，任何一条不过就视为该侧不可用：
+ *   1. 三个点都不能贴画面边缘（贴边通常意味着被裁掉）
+ *   2. 膝要在髋与踝之间（y 方向居中），腿不能在解剖上反着长
+ *   3. 髋→踝的垂直跨度要够大、且膝是这段的中段（防止三点挤在一起）
+ */
+export interface LegCheckOptions {
+  minVisibility?: number
+  /** 距画面边缘小于该比例视为"被裁掉" */
+  edgeMargin?: number
+  /** 髋→踝的最小垂直跨度（归一化坐标），低于此说明腿没入画 */
+  minLegSpan?: number
+}
+
+export interface LegCheckResult {
+  ok: boolean
+  side: 'left' | 'right' | 'both' | null
+  /** 不可用时的原因，直接可以提示给用户 */
+  reason?: string
+}
+
+function usableSide(
+  hip: LandmarkPoint | undefined,
+  knee: LandmarkPoint | undefined,
+  ankle: LandmarkPoint | undefined,
+  minVisibility: number,
+  edgeMargin: number,
+  minLegSpan: number,
+): boolean {
+  if (!visible(hip, minVisibility) || !visible(knee, minVisibility) || !visible(ankle, minVisibility)) {
+    return false
+  }
+
+  const points = [hip as LandmarkPoint, knee as LandmarkPoint, ankle as LandmarkPoint]
+  for (const p of points) {
+    if (p.x < edgeMargin || p.x > 1 - edgeMargin || p.y < edgeMargin || p.y > 1 - edgeMargin) {
+      return false // 贴边 = 被裁
+    }
+  }
+
+  const span = Math.abs((ankle as LandmarkPoint).y - (hip as LandmarkPoint).y)
+  if (span < minLegSpan) return false // 腿的长度在画面里太短 = 没拍全
+
+  const kneeY = (knee as LandmarkPoint).y
+  const top = Math.min((hip as LandmarkPoint).y, (ankle as LandmarkPoint).y)
+  const bottom = Math.max((hip as LandmarkPoint).y, (ankle as LandmarkPoint).y)
+  const tolerance = span * 0.15
+  if (kneeY < top - tolerance || kneeY > bottom + tolerance) return false // 膝盖跑到髋踝连线之外
+
+  return true
+}
+
+export function legLooksComplete(
+  landmarks: LandmarkPoint[],
+  opts: LegCheckOptions = {},
+): LegCheckResult {
+  const minVisibility = opts.minVisibility ?? 0.5
+  const edgeMargin = opts.edgeMargin ?? 0.02
+  const minLegSpan = opts.minLegSpan ?? 0.12
+
+  const leftOk = usableSide(
+    landmarks[POSE.leftHip],
+    landmarks[POSE.leftKnee],
+    landmarks[POSE.leftAnkle],
+    minVisibility,
+    edgeMargin,
+    minLegSpan,
+  )
+  const rightOk = usableSide(
+    landmarks[POSE.rightHip],
+    landmarks[POSE.rightKnee],
+    landmarks[POSE.rightAnkle],
+    minVisibility,
+    edgeMargin,
+    minLegSpan,
+  )
+
+  if (leftOk && rightOk) return { ok: true, side: 'both' }
+  if (leftOk) return { ok: true, side: 'left' }
+  if (rightOk) return { ok: true, side: 'right' }
+  return {
+    ok: false,
+    side: null,
+    reason: '看不到完整的腿（髋/膝/踝）。请后退，让全身进入画面，并尽量侧身站。',
+  }
+}
+
+
 function visible(lm: LandmarkPoint | undefined, minVisibility: number): boolean {
   if (!lm) return false
   // MediaPipe 有时不给 visibility（例如手动构造的测试数据），默认视为可见

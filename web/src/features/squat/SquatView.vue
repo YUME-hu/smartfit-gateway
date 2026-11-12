@@ -14,7 +14,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { RepEvent, SquatPhase } from './types'
 import type { SquatState } from './squatCounter'
 import { createSquatState, feedSquatAngle, phaseLabel } from './squatCounter'
-import { kneeAngleFromPose } from './poseMath'
+import { kneeAngleFromPose, legLooksComplete } from './poseMath'
 import { drawSkeleton } from './drawSkeleton'
 import { usePoseLandmarker } from './usePoseLandmarker'
 import { createRepsWriter } from './repsSync'
@@ -40,6 +40,8 @@ const recent = ref<RepEvent[]>([])
 const savedCount = ref(0)
 const failedCount = ref(0)
 const hint = ref('')
+/** 取景不合格时的提示（腿没拍全就不计数，避免拿幻觉关键点算角度） */
+const framingHint = ref('')
 
 const videoEl = ref<HTMLVideoElement | null>(null)
 const canvasEl = ref<HTMLCanvasElement | null>(null)
@@ -49,6 +51,8 @@ let counter: SquatState = createSquatState()
 let rafId = 0
 let stream: MediaStream | null = null
 let objectUrl: string | null = null
+/** 腿第一次被判为不完整的时间点，用来避免一闪而过的误提示 */
+let legBadSince = 0
 
 /** 一次会话 id：同一次训练的所有 reps 共享，方便和手表数据按时间段对齐 */
 const sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
@@ -78,6 +82,8 @@ function resetCounter(): void {
   angle.value = null
   recent.value = []
   lastRep.value = null
+  framingHint.value = ''
+  legBadSince = 0
 }
 
 async function onRepDone(rep: RepEvent): Promise<void> {
@@ -122,18 +128,32 @@ function loop(): void {
       const landmarks = res?.landmarks?.[0]
       if (landmarks && landmarks.length) {
         drawSkeleton(ctx, landmarks, c.width, c.height)
-        const knee = kneeAngleFromPose(landmarks)
-        angle.value = knee.angle
-        if (knee.angle !== null) {
-          const t = performance.now()
-          const r = feedSquatAngle(counter, knee.angle, t)
-          counter = r.state
-          reps.value = r.state.reps
-          phase.value = r.state.phase
-          if (r.rep) void onRepDone(r.rep)
+
+        // 先过"腿有没有完整入画"这一关：没拍全就绝不计数
+        const leg = legLooksComplete(landmarks)
+        if (!leg.ok) {
+          angle.value = null
+          if (!legBadSince) legBadSince = performance.now()
+          if (performance.now() - legBadSince > 700) {
+            framingHint.value = leg.reason ?? '取景不合格'
+          }
+        } else {
+          legBadSince = 0
+          framingHint.value = ''
+          const knee = kneeAngleFromPose(landmarks)
+          angle.value = knee.angle
+          if (knee.angle !== null) {
+            const t = performance.now()
+            const r = feedSquatAngle(counter, knee.angle, t)
+            counter = r.state
+            reps.value = r.state.reps
+            phase.value = r.state.phase
+            if (r.rep) void onRepDone(r.rep)
+          }
         }
       } else {
         angle.value = null
+        framingHint.value = '没有检测到人，请站到画面里'
       }
     }
   }
@@ -291,6 +311,8 @@ onBeforeUnmount(() => {
             : '先「选择文件」载入一段深蹲视频，再点「开始分析」' }}
         </p>
       </div>
+
+      <div v-if="running && framingHint" class="framing">{{ framingHint }}</div>
     </div>
 
     <div class="actions">
@@ -450,7 +472,11 @@ onBeforeUnmount(() => {
 .feed {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  /* 用 contain 而不是 cover：
+     cover 在摄像头不是 16:9 时会裁掉画面，但 MediaPipe 读的是完整原始帧、
+     canvas 也按原始比例绘制 —— 显示被裁 + 骨架没裁 = 对不上。
+     contain 让两者都按同一比例 letterbox，永远不会错位。 */
+  object-fit: contain;
   display: block;
 }
 
@@ -464,6 +490,8 @@ onBeforeUnmount(() => {
   inset: 0;
   width: 100%;
   height: 100%;
+  /* canvas 是替换元素，object-fit 同样生效，保证与 video 的 letterbox 完全一致 */
+  object-fit: contain;
   pointer-events: none;
 }
 
@@ -537,6 +565,24 @@ onBeforeUnmount(() => {
   text-align: center;
   background: rgba(11, 13, 18, 0.72);
   color: #8b93a7;
+}
+
+.framing {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  max-width: 80%;
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: rgba(255, 92, 92, 0.18);
+  border: 1px solid rgba(255, 92, 92, 0.55);
+  color: #ffc2c2;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+  pointer-events: none;
+  backdrop-filter: blur(4px);
 }
 
 .idle-title {
