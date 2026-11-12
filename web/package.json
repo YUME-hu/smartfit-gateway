@@ -11,7 +11,7 @@
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
     "build:test": "tsc -p tsconfig.test.json",
-    "test": "npm run build:test && node --test tests/squatCounter.test.cjs",
+    "test": "npm run build:test && node --test tests/squatCounter.test.cjs tests/petRules.test.cjs",
     "verify": "npm run typecheck && npm test"
   },
   "dependencies": {

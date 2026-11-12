@@ -13,10 +13,11 @@
 import { computed, ref } from 'vue'
 import LiveChart from './components/LiveChart.vue'
 import SquatView from './features/squat/SquatView.vue'
+import PetView from './features/pet/PetView.vue'
 import { useDeviceLatest } from './composables/useDeviceLatest'
 
-/** 顶部 Tab：实时数据看板 / 深蹲识别（不引 vue-router，减少一层依赖） */
-const tab = ref<'data' | 'squat'>('data')
+/** 顶部 Tab：实时数据 / 深蹲识别 / 我的宠物（不引 vue-router，减少一层依赖） */
+const tab = ref<'data' | 'squat' | 'pet'>('data')
 
 const env = import.meta.env
 const supabaseUrl = env.VITE_SUPABASE_URL as string | undefined
@@ -72,6 +73,9 @@ const stale = computed(() => lastAt.value > 0 && Date.now() - lastAt.value > 150
       </button>
       <button :class="['app-tab', { active: tab === 'squat' }]" @click="tab = 'squat'">
         深蹲识别
+      </button>
+      <button :class="['app-tab', { active: tab === 'pet' }]" @click="tab = 'pet'">
+        我的宠物
       </button>
     </nav>
 
@@ -149,6 +153,7 @@ const stale = computed(() => lastAt.value > 0 && Date.now() - lastAt.value > 150
     </template>
 
     <SquatView v-else-if="tab === 'squat'" />
+    <PetView v-else-if="tab === 'pet'" :steps="sessionSteps" :last-at="lastAt" />
   </div>
 </template>
 

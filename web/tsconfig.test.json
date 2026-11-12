@@ -8,5 +8,10 @@
     "moduleResolution": "Node",
     "types": []
   },
-  "include": ["src/features/squat/squatCounter.ts", "src/features/squat/poseMath.ts", "src/features/squat/types.ts"]
+  "include": [
+    "src/features/squat/squatCounter.ts",
+    "src/features/squat/poseMath.ts",
+    "src/features/squat/types.ts",
+    "src/features/pet/petRules.ts"
+  ]
 }
