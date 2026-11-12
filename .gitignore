@@ -6,3 +6,6 @@ node_modules/
 .env
 .env.local
 .env.*.local
+
+# 固件串口日志是实测证据，保留（上面的 *.log 只针对本地临时日志）
+!firmware/logs/*.log

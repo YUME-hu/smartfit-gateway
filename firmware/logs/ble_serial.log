@@ -1,0 +1,42 @@
+﻿
+==================================================
+ ESP32_Fitness_Watch  (BLE 加速度 + 计步节点)
+ Board : ESP32-S3-Touch-AMOLED-2.06 / ESP32-S3R8
+ Sensor: QMI8658C  @ I2C
+==================================================
+       0x18 在线
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0x15 (USB_UART_CHIP_RESET),boot:0x2b (SPI_FAST_FLASH_BOOT)
+Saved PC:0x4037f9b2
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fce2820,len:0x10cc
+load:0x403c8700,len:0xc2c
+load:0x403cb700,len:0x30b0
+entry 0x403c88b8
+
+==================================================
+ ESP32_Fitness_Watch  (BLE 加速度 + 计步节点)
+ Board : ESP32-S3-Touch-AMOLED-2.06 / ESP32-S3R8
+ Sensor: QMI8658C  @ I2C
+==================================================
+[I2C] 扫描 SDA=15 SCL=14 ...
+       0x18 在线
+       0x34 在线
+       0x40 在线
+       0x51 在线
+       0x6B 在线
+       0x7E 在线
+[I2C] SDA=15 SCL=14 应答设备数 = 6
+[OK] QMI8658 已应答，地址 0x6B (SDA=15 SCL=14)
+传感器初始化成功
+计步器就绪：25Hz 采样，5 秒窗口聚合
+蓝牙准备就绪，设备名 "ESP32_Fitness_Watch"
+  服务 UUID: 0000FFF0-0000-1000-8000-00805F9B34FB
+  特征 UUID: 0000FFF1-0000-1000-8000-00805F9B34FB (NOTIFY)
+  等待主机连接...
+[WIN] n=119 std=0.005 peak=0.021 steps=0 total=0 len=21 未连接
+[WIN] n=125 std=0.001 peak=0.004 steps=0 total=0 len=21 未连接
+[WIN] n=125 std=0.001 peak=0.005 steps=0 total=0 len=21 未连接
+[WIN] n=125 std=0.001 peak=0.004 steps=0 total=0 len=21 未连接

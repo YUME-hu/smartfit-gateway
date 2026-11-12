@@ -1,0 +1,47 @@
+﻿
+==================================================
+ StepCounter 合成信号自测
+==================================================
+[SEG] 静置(预热)         3.0s f=1.0Hz amp=0.00g noise=0.01 -> steps=0 std=0.006 peak=0.014
+[SEG] 走路 1.8Hz/0.35g     10.0s f=1.8Hz amp=0.35g noise=0.03 -> steps=18 std=0.239 peak=0.368
+  [PASS] 走路能计步: got=18 expect=[14,22]
+[SEG] 微振 2Hz/0.05g       5.0s f=2.0Hz amp=0.05g noise=0.01 -> steps=0 std=0.036 peak=0.067
+  [PASS] 小幅振动不误报: got=0 expect=[0,1]
+[SEG] 静置(收尾)         3.0s f=1.0Hz amp=0.00g noise=0.01 -> steps=0 std=0.006 peak=0.014
+  [PASS] 静置不误报: got=0 expect=[0,0]
+[SEG] 强度对比(取样)   2.0s f=1.8Hz amp=0.35g noise=0.02 -> steps=4 std=0.235 peak=0.347
+[SEG] 静置对比(取样)   2.0s f=1.0Hz amp=0.00g noise=0.01 -> steps=0 std=0.017 peak=0.042
+  [PASS] 走路方差明显大于静置: got=235 expect=[117,1000]
+--------------------------------------------------
+走路 std=0.235g peak=0.347g | 静置 std=0.017g
+SELFTEST RESULT: PASS
+--------------------------------------------------
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0x15 (USB_UART_CHIP_RESET),boot:0x2b (SPI_FAST_FLASH_BOOT)
+Saved PC:0x40378b92
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fce2820,len:0x10cc
+load:0x403c8700,len:0xc2c
+load:0x403cb700,len:0x30b0
+entry 0x403c88b8
+
+==================================================
+ StepCounter 合成信号自测
+==================================================
+[SEG] 静置(预热)         3.0s f=1.0Hz amp=0.00g noise=0.01 -> steps=0 std=0.006 peak=0.014
+  [PASS] 静置不误报: got=0 expect=[0,0]
+[SEG] 走路 1.8Hz/0.35g     10.0s f=1.8Hz amp=0.35g noise=0.03 -> steps=18 std=0.239 peak=0.368
+  [PASS] 走路能计步: got=18 expect=[14,22]
+[SEG] 微振 2Hz/0.05g       5.0s f=2.0Hz amp=0.05g noise=0.01 -> steps=0 std=0.036 peak=0.067
+  [PASS] 小幅振动不误报: got=0 expect=[0,1]
+[SEG] 静置(收尾)         3.0s f=1.0Hz amp=0.00g noise=0.01 -> steps=0 std=0.006 peak=0.014
+  [PASS] 静置不误报: got=0 expect=[0,0]
+[SEG] 强度对比(取样)   2.0s f=1.8Hz amp=0.35g noise=0.02 -> steps=4 std=0.235 peak=0.347
+[SEG] 静置对比(取样)   2.0s f=1.0Hz amp=0.00g noise=0.01 -> steps=0 std=0.017 peak=0.042
+  [PASS] 走路方差明显大于静置: got=235 expect=[117,1000]
+--------------------------------------------------
+走路 std=0.235g peak=0.347g | 静置 std=0.017g
+SELFTEST RESULT: PASS
+--------------------------------------------------
