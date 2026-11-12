@@ -1,0 +1,24 @@
+{
+  "name": "smartfit-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "SmartFit 实时看板：订阅 Supabase device_latest，展示步数与合模量",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "echarts": "^5.5.1",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vue-tsc": "^2.1.10"
+  }
+}

@@ -44,6 +44,58 @@ App 网关
 | ⑥ 波形/步数图表 | `components/MiniChart.vue` | ✅ SFC 编译，⚠️ 未真机 |
 | ⑦ 云端 schema | `supabase/migrations/`（3 个迁移） | ✅ `db push` 已应用 + 10 项校验全过 |
 
+## Web 实时看板（`web/`）
+
+独立的 Vite + Vue3 项目，订阅 `device_latest` 的 Realtime 变化，实时显示步数与合模量。
+
+### 启动
+
+```bash
+cd web
+npm install
+cp .env.example .env      # 填 VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY
+npm run dev               # http://localhost:5199
+```
+
+生产构建：`npm run build`（产物在 `web/dist`）→ `npm run preview` 本地预览。
+
+### 技术选择
+
+- **ECharts 按需引入**：`echarts/core` + `LineChart`/`BarChart` + `Grid/Tooltip/Legend`
+  + `CanvasRenderer`。全量 `import * as echarts from 'echarts'` 产物 1.34 MB，
+  按需后 **804 kB（gzip 257 kB）**。
+- 不引 `vue-echarts`，自己管实例生命周期 / resize / dispose，少一层依赖。
+- 图表用固定 **5 分钟时间窗**（`xAxis.min = lastT - 5min`），数据自然左移，
+  比让轴自动缩放更像"滚动"。
+- `vue-tsc --noEmit` 做类型检查（`npm run typecheck`），CI 里可当门禁。
+
+### 界面
+
+- 四张 KPI：合模量 |a|、最近 5 秒步数、会话累计、最后更新时间
+- 折线图：左轴 |a|（折线+面积）、右轴窗口步数（柱状），共用时间轴
+- 状态胶囊：实时在线 / 连接中 / 连接异常，附「重连」按钮
+- 超过 15 秒没更新会把时间标黄（3 个包周期）
+
+### ⚠️ 两个必须知道的口径问题
+
+1. **`steps` 是「最近 5 秒窗口的步数」，不是全天累计。**
+   页面上的「会话累计」是前端从打开页面起自己叠加的，刷新归零。
+   要真正的日/周累计，需要服务端聚合视图（例如按 `date_trunc('hour', recorded_at)`
+   建视图并给 anon 只读权限），目前没做——因为 `imu_samples` 对 anon 不开放查询。
+2. **数值停在第一帧不动** → 99% 是 `device_latest` 没开 `replica identity full`
+   （见上文「坑 2」）。订阅会显示「实时在线」，但收不到 UPDATE 事件。
+
+### 实测记录（浏览器端 E2E）
+
+用真实项目跑过一遍：写入 `device_latest` → 页面在 1.5 秒内更新
+（`|a|` 0.998 → 1.000 g，窗口步数 7 → 3，会话累计 7 → 10），
+canvas 1102×380 采样到 551 个非背景像素，确认图表真的绘制了。
+
+> 排障中发现的一个环境坑：本机 IE/系统代理开着（`127.0.0.1:7892`），
+> 浏览器会把 `*.supabase.co` 也走代理并被断开（`ERR_CONNECTION_CLOSED`），
+> 而 `curl` / Node 不读系统代理所以一直正常。如果页面在浏览器里连不上而
+> 命令行能通，先看「设置 → 网络 → 代理」。
+
 ## 工程化三件事
 
 ### 1. 配置走 .env（供 CI 注入）
@@ -143,16 +195,21 @@ app-gateway/
 │     ├─ storage.ts               存储抽象（uni / 内存）
 │     ├─ cache.ts                 分块持久化队列
 │     ├─ session.ts               上电会话判定 + 幂等键
-│     ├─ supabaseRest.ts          PostgREST 批量 upsert
+│     ├─ supabaseRest.ts          样本走 RPC / 最新值走 PostgREST upsert
 │     ├─ syncEngine.ts            15 分钟定时 / 手动 / 退避重试 / 单飞
 │     ├─ latest.ts                最新值节流发布
 │     ├─ bleTransport.ts          uni-app BLE 扫描/连接/重连
 │     └─ useImuGateway.ts         Vue3 装配层（含图表历史缓冲）
-├─ components/MiniChart.vue       原生 canvas 折线/柱状图（零依赖）
+├─ components/MiniChart.vue       原生 canvas 折线/柱状图（零依赖，App 用）
 ├─ pages/gateway/index.vue        演示页：步数主视觉 + 双图表 + 立即同步
-├─ web/useDeviceLatest.ts         Vue3 Web 端 Realtime 订阅
+├─ web/                           ★ Vite + Vue3 实时看板（ECharts）
+│  ├─ src/App.vue                 KPI 卡片 + 图表 + 状态
+│  ├─ src/components/LiveChart.vue ECharts 薄封装（按需引入）
+│  ├─ src/composables/useDeviceLatest.ts  Realtime 订阅 + 去重 + 滚动缓冲
+│  └─ vite.config.ts              dev 端口 5199
+├─ firmware/                      ESP32 固件（计步 + BLE）
 ├─ supabase/migrations/           Supabase CLI 迁移（唯一 schema 来源）
-├─ scripts/check-sfc.cjs          .vue 编译检查
+├─ scripts/                       单测/SFC/workflow/云端验证脚本
 ├─ tests/gateway.test.cjs         20 个单元测试
 └─ .github/workflows/build-apk.yml
 ```
@@ -272,4 +329,13 @@ npm run verify      # 上面三个一起跑
 # 连云端验证（需要环境变量，见上）
 npm run verify:db   # schema / RLS / RPC / publication
 npm run verify:rt   # Realtime 是否真的推事件
+```
+
+Web 看板：
+
+```bash
+cd web
+npm run dev        # http://localhost:5199
+npm run typecheck  # vue-tsc
+npm run build      # 产物 web/dist
 ```
