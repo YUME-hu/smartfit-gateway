@@ -15,7 +15,8 @@ import type { RepEvent, SquatPhase } from './types'
 import type { SquatState } from './squatCounter'
 import { createSquatState, feedSquatAngle, phaseLabel } from './squatCounter'
 import { kneeAngleFromPose, legLooksComplete } from './poseMath'
-import { drawSkeleton } from './drawSkeleton'
+import { drawFramingGuide, drawSkeleton, framingLabel } from './drawSkeleton'
+import type { FramingState } from './drawSkeleton'
 import { usePoseLandmarker } from './usePoseLandmarker'
 import { createRepsWriter } from './repsSync'
 
@@ -42,6 +43,8 @@ const failedCount = ref(0)
 const hint = ref('')
 /** 取景不合格时的提示（腿没拍全就不计数，避免拿幻觉关键点算角度） */
 const framingHint = ref('')
+/** 引导框状态：idle 没人 / bad 需调整 / good 取景完美 */
+const framingState = ref<FramingState>('idle')
 
 const videoEl = ref<HTMLVideoElement | null>(null)
 const canvasEl = ref<HTMLCanvasElement | null>(null)
@@ -74,6 +77,15 @@ const modelText = computed(() => {
 })
 
 const phaseClass = computed(() => `phase-${phase.value}`)
+
+const framingText = computed(() => framingLabel(framingState.value))
+const framingClass = computed(() =>
+  framingState.value === 'good'
+    ? 'framing-good'
+    : framingState.value === 'bad'
+      ? 'framing-bad'
+      : 'framing-idle',
+)
 
 function resetCounter(): void {
   counter = createSquatState()
@@ -127,16 +139,25 @@ function loop(): void {
     if (ctx) {
       ctx.clearRect(0, 0, c.width, c.height)
       const landmarks = res?.landmarks?.[0]
+
+      // 先判定取景，再把引导框画出来（框的出处就是判定结果，人站对了会变绿）
+      let legOk = false
+      if (landmarks && landmarks.length) {
+        legOk = legLooksComplete(landmarks).ok
+      }
+      const state: FramingState = !landmarks || !landmarks.length ? 'idle' : legOk ? 'good' : 'bad'
+      drawFramingGuide(ctx, c.width, c.height, state)
+      framingState.value = state
+
       if (landmarks && landmarks.length) {
         drawSkeleton(ctx, landmarks, c.width, c.height)
 
-        // 先过"腿有没有完整入画"这一关：没拍全就绝不计数
-        const leg = legLooksComplete(landmarks)
-        if (!leg.ok) {
+        // 腿没拍全就绝不计数（否则拿的是 MediaPipe 外推出来的假膝角）
+        if (!legOk) {
           angle.value = null
           if (!legBadSince) legBadSince = performance.now()
           if (performance.now() - legBadSince > 700) {
-            framingHint.value = leg.reason ?? '取景不合格'
+            framingHint.value = legLooksComplete(landmarks).reason ?? '取景不合格'
           }
         } else {
           legBadSince = 0
@@ -298,6 +319,7 @@ onBeforeUnmount(() => {
         <div class="hud-top">
           <span class="chip" :class="phaseClass">{{ phaseText }}</span>
           <span class="chip angle">膝角 {{ angleText }}°</span>
+          <span class="chip" :class="framingClass">{{ framingText }}</span>
         </div>
         <div class="hud-count">
           <span class="num">{{ reps }}</span><span class="unit">次</span>
@@ -532,6 +554,23 @@ onBeforeUnmount(() => {
 .phase-bottom {
   color: #3d7eff;
   border-color: rgba(61, 126, 255, 0.5);
+}
+
+.framing-good {
+  color: #3ddc84;
+  border-color: rgba(61, 220, 132, 0.55);
+  background: rgba(61, 220, 132, 0.12);
+  font-weight: 600;
+}
+
+.framing-bad {
+  color: #ffb020;
+  border-color: rgba(255, 176, 32, 0.55);
+  background: rgba(255, 176, 32, 0.12);
+}
+
+.framing-idle {
+  color: #c7cede;
 }
 
 .hud-count {
