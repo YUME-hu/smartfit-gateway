@@ -23,6 +23,7 @@ import { createRepsWriter } from './repsSync'
 const env = import.meta.env
 const supabaseUrl = (env.VITE_SUPABASE_URL as string | undefined) ?? ''
 const supabaseKey = (env.VITE_SUPABASE_ANON_KEY as string | undefined) ?? ''
+const DEVICE_ID = (env.VITE_DEVICE_ID as string | undefined) || 'watch-01'
 const canSync = Boolean(supabaseUrl && supabaseKey)
 
 const writer = canSync ? createRepsWriter(supabaseUrl, supabaseKey) : null
@@ -112,6 +113,7 @@ async function onRepDone(rep: RepEvent): Promise<void> {
     finishedAt: Date.now(),
     minAngle: rep.minAngle,
     durationMs: rep.durationMs,
+    deviceId: DEVICE_ID,
   })
 
   if (res.outcome === 'ok' || res.outcome === 'duplicate') savedCount.value++

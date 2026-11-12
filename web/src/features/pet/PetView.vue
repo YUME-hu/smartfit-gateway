@@ -2,13 +2,11 @@
 /**
  * 我的宠物（数字生命养成）
  *
- * 数据来源：
- *   · 步数：父组件传进来的 `steps`（= 已订阅的 device_latest 窗口步数累加）
- *   · 深蹲：目前用调试按钮模拟（reps 表对 anon 不可读，正式版要接 RPC，见下方 TODO）
+ * 数据全部来自服务端（pet_state）：
+ *   步数/深蹲 → 数据库触发器累加 → exp 是生成列 → RPC 读回来 → Realtime 推送
+ * 所以刷新页面、换浏览器、手机重新同步，宠物的等级都不会变。
  *
- * 经验设计成**累计量的纯函数**（expFromSteps(总步数)），所以：
- *   · 刷新页面重放数据不会多给经验
- *   · 手机上批同步过来的数据，也是"到账即按总量结算"
+ * 前端只做三件事：读 RPC、订阅变更、渲染规则（等级阈值仍是 petRules.ts 说了算）。
  */
 
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
@@ -16,51 +14,69 @@ import PetAvatar from './PetAvatar.vue'
 import { celebrationImage, imageForMood, PET_CREDIT } from './petAssets'
 import {
   decayHunger,
-  expFromReps,
-  expFromSteps,
-  foodFromReps,
-  foodFromSteps,
   moodOf,
   progressOf,
   stageFromLevel,
 } from './petRules'
 import type { PetMood } from './petRules'
+import { usePetState } from './usePetState'
 
 const props = defineProps<{
-  /** 本次会话累计步数（来自 device_latest） */
-  steps: number
-  /** 最近一次收到数据的时刻，用于判断"正在运动" */
+  /** 最近一次收到手表数据的时刻，用于判断"正在运动" */
   lastAt: number
 }>()
 
-// ---------------------------------------------------------------- 状态
+const env = import.meta.env
+const supabaseUrl = (env.VITE_SUPABASE_URL as string | undefined) ?? ''
+const supabaseKey = (env.VITE_SUPABASE_ANON_KEY as string | undefined) ?? ''
+const DEVICE_ID = (env.VITE_DEVICE_ID as string | undefined) || 'watch-01'
+const enabled = Boolean(supabaseUrl && supabaseKey)
 
-/** 调试/奖励经验，正式版应由服务端 pet_state 提供 */
-const bonusExp = ref(0)
-/** 深蹲次数（正式版从 reps 表聚合，目前调试模拟） */
-const squats = ref(0)
-const hunger = ref(80)
-const foodUsed = ref(0)
+const {
+  summary,
+  status,
+  error,
+  busy,
+  refresh,
+  feed,
+  addBonusExp,
+  recordSquat,
+} = usePetState({ supabaseUrl, supabaseAnonKey: supabaseKey, deviceId: DEVICE_ID, enabled })
+
+// ---------------------------------------------------------------- 本地 UI 状态
+
 const celebrating = ref(false)
 const now = ref(Date.now())
 const events = ref<Array<{ t: number; text: string }>>([])
 const avatarRef = ref<InstanceType<typeof PetAvatar> | null>(null)
+const sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+let repSeq = 0
 
 let tick: number | undefined
+let refreshTimer: number | undefined
 let celebrateTimer: number | undefined
 
 // ---------------------------------------------------------------- 派生
 
-const stepsExp = computed(() => expFromSteps(props.steps))
-const repsExp = computed(() => expFromReps(squats.value))
-const totalExp = computed(() => stepsExp.value + repsExp.value + bonusExp.value)
-const progress = computed(() => progressOf(totalExp.value))
+const exp = computed(() => summary.value?.exp ?? 0)
+const progress = computed(() => progressOf(exp.value))
 const stage = computed(() => stageFromLevel(progress.value.level))
 
-const foodEarned = computed(() => foodFromSteps(props.steps) + foodFromReps(squats.value))
-const food = computed(() => Math.max(0, foodEarned.value - foodUsed.value))
+const stepsTotal = computed(() => summary.value?.steps_total ?? 0)
+const repsTotal = computed(() => summary.value?.reps_total ?? 0)
+const food = computed(() => summary.value?.food ?? 0)
 
-/** 10 秒内有过数据 = 正在运动 */
+/**
+ * 饥饿度用服务端返回的瞬时值，本地再按秒衰减做平滑显示
+ * （避免两次刷新之间数字一动不动，看起来像卡住）
+ */
+const hunger = computed(() => {
+  const base = summary.value?.hunger
+  if (base === undefined) return 0
+  const updatedAt = summary.value?.updated_at ? Date.parse(summary.value.updated_at) : now.value
+  return decayHunger(base, Math.max(0, now.value - updatedAt))
+})
+
 const active = computed(() => props.lastAt > 0 && now.value - props.lastAt < 10000)
 const mood = computed<PetMood>(() => moodOf(hunger.value, active.value))
 const petSrc = computed(() => (celebrating.value ? celebrationImage() : imageForMood(mood.value)))
@@ -74,9 +90,24 @@ const MOOD_TEXT: Record<PetMood, string> = {
   dizzy: '晕乎乎的',
 }
 const moodText = computed(() => MOOD_TEXT[mood.value])
-
 const stageText = computed(() => (stage.value === 1 ? '幼体' : stage.value === 2 ? '少年' : '成熟体'))
 const hungerTone = computed(() => (hunger.value < 25 ? 'bad' : hunger.value < 50 ? 'warn' : 'ok'))
+
+const statusText = computed(() => {
+  if (!enabled) return '未配置'
+  switch (status.value) {
+    case 'live':
+      return '实时同步'
+    case 'error':
+      return '同步异常'
+    case 'closed':
+      return '未连接'
+    default:
+      return '连接中'
+  }
+})
+
+// ---------------------------------------------------------------- 行为
 
 function log(text: string): void {
   events.value.unshift({ t: Date.now(), text })
@@ -89,29 +120,32 @@ function celebrate(): void {
   celebrateTimer = window.setTimeout(() => (celebrating.value = false), 1800)
 }
 
-// ---------------------------------------------------------------- 交互
-
-function feed(): void {
-  if (food.value < 1) {
+async function onFeed(): Promise<void> {
+  if (busy.value) return
+  const r = await feed()
+  if (r.ok) {
+    celebrate()
+    log('喂食成功，饱食度 +20')
+  } else if (r.reason === 'no_food') {
     log('食物不够，多走走或做几个深蹲吧')
-    return
+  } else {
+    log(`喂食失败：${r.reason ?? '未知错误'}`)
   }
-  foodUsed.value++
-  hunger.value = Math.min(100, hunger.value + 20)
-  celebrate()
-  log('喂食成功，饱食度 +20')
 }
 
-/** 调试：模拟深蹲（正式版替换为 reps 聚合） */
-function simulateSquats(n: number): void {
-  squats.value += n
-  log(`模拟 ${n} 个深蹲`)
+/** 调试：真实写 10 条深蹲记录（走 anon INSERT → 触发器 → pet_state） */
+async function simulateSquats(): Promise<void> {
+  for (let i = 0; i < 10; i++) {
+    repSeq++
+    await recordSquat(sessionId, repSeq)
+  }
+  await refresh()
+  log('模拟 10 个深蹲（已真实写库）')
 }
 
-/** 调试：直接加经验，用来验证进化动画 */
-function addExp(n: number): void {
-  bonusExp.value += n
-  log(`调试：经验 +${n}`)
+async function onAddExp(): Promise<void> {
+  await addBonusExp(100)
+  log('调试：奖励经验 +100')
 }
 
 function forceEvolution(): void {
@@ -125,21 +159,33 @@ watch(
   () => progress.value.level,
   (next, prev) => {
     if (next > prev) {
-      log(`升级到 Lv${next}${stage.value !== stageFromLevel(prev) ? '，形态进化！' : ''}`)
+      const evolved = stage.value !== stageFromLevel(prev)
+      log(`升级到 Lv${next}${evolved ? '，形态进化！' : ''}`)
       celebrate()
     }
+  },
+)
+
+watch(
+  () => error.value,
+  (e) => {
+    if (e) log(`同步错误：${e}`)
   },
 )
 
 onMounted(() => {
   tick = window.setInterval(() => {
     now.value = Date.now()
-    hunger.value = decayHunger(hunger.value, 2000)
   }, 2000)
+  // 60 秒兜底刷新，保证饥饿度衰减、以及 Realtime 偶发丢事件后能自愈
+  refreshTimer = window.setInterval(() => {
+    void refresh()
+  }, 60000)
 })
 
 onBeforeUnmount(() => {
   if (tick) clearInterval(tick)
+  if (refreshTimer) clearInterval(refreshTimer)
   if (celebrateTimer) clearTimeout(celebrateTimer)
 })
 </script>
@@ -152,14 +198,17 @@ onBeforeUnmount(() => {
           <h2>深海鲸鱼娘</h2>
           <span class="badge">Lv{{ progress.level }} · {{ stageText }}</span>
         </div>
-        <span class="mood" :class="mood">{{ moodText }}</span>
+        <div class="head-right">
+          <span class="sync" :class="status">{{ statusText }}</span>
+          <span class="mood" :class="mood">{{ moodText }}</span>
+        </div>
       </div>
 
       <PetAvatar ref="avatarRef" :src="petSrc" :stage="stage" alt="宠物" />
 
       <div class="exp-block">
         <div class="exp-top">
-          <span>经验 {{ totalExp }}</span>
+          <span>经验 {{ exp }}</span>
           <span v-if="progress.nextAt !== null">
             {{ progress.expIntoLevel }} / {{ progress.expForLevel }} → Lv{{ progress.level + 1 }}
           </span>
@@ -178,20 +227,25 @@ onBeforeUnmount(() => {
         <div class="bar">
           <div class="fill" :class="hungerTone" :style="{ width: hunger + '%' }"></div>
         </div>
-        <button class="feed" :disabled="food < 1" @click="feed">喂食（消耗 1 食物）</button>
+        <button class="feed" :disabled="food < 1 || busy" @click="onFeed">
+          {{ busy ? '喂食中…' : '喂食（消耗 1 食物）' }}
+        </button>
       </div>
+
+      <p v-if="!summary && enabled" class="loading">正在读取宠物状态…</p>
+      <p v-if="!enabled" class="loading">未配置 Supabase 环境变量，宠物无法持久化</p>
     </section>
 
     <section class="stats">
       <div class="stat">
-        <span class="k">本次步数</span>
-        <span class="v">{{ steps }}</span>
-        <span class="s">≈ {{ stepsExp }} 经验</span>
+        <span class="k">累计步数（云端）</span>
+        <span class="v">{{ stepsTotal }}</span>
+        <span class="s">每 100 步 = 10 经验 + 1 食物</span>
       </div>
       <div class="stat">
-        <span class="k">深蹲</span>
-        <span class="v">{{ squats }}</span>
-        <span class="s">≈ {{ repsExp }} 经验</span>
+        <span class="k">深蹲（云端）</span>
+        <span class="v">{{ repsTotal }}</span>
+        <span class="s">每 10 个 = 15 经验 + 2 食物</span>
       </div>
       <div class="stat">
         <span class="k">形态</span>
@@ -214,13 +268,12 @@ onBeforeUnmount(() => {
     <details class="debug">
       <summary>调试面板（演示与测试用）</summary>
       <div class="debug-body">
-        <button @click="addExp(100)">经验 +100</button>
-        <button @click="simulateSquats(10)">模拟 10 个深蹲</button>
+        <button @click="onAddExp">奖励经验 +100</button>
+        <button @click="simulateSquats">模拟 10 个深蹲</button>
         <button @click="forceEvolution()">播一次进化动画</button>
         <p class="debug-note">
-          步数来自 <code>device_latest</code> 实时订阅（本次会话累计）；
-          深蹲数暂用按钮模拟 —— <code>reps</code> 表对 anon 不开放读取，
-          正式版需要加一个聚合 RPC。
+          经验来自 <code>pet_state</code>（<code>exp</code> 是生成列，由累计步数/深蹲算出），
+          刷新不会丢。深蹲按钮会**真实写入 <code>reps</code> 表**并触发宠物累加。
         </p>
       </div>
     </details>
@@ -284,6 +337,31 @@ onBeforeUnmount(() => {
   background: rgba(61, 126, 255, 0.12);
   color: #9dc0ff;
   font-family: monospace;
+}
+
+.head-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sync {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid #23262f;
+  color: #6b7387;
+}
+
+.sync.live {
+  color: #3ddc84;
+  border-color: rgba(61, 220, 132, 0.4);
+  background: rgba(61, 220, 132, 0.1);
+}
+
+.sync.error {
+  color: #ff5c5c;
+  border-color: rgba(255, 92, 92, 0.4);
 }
 
 .mood {
@@ -363,6 +441,12 @@ onBeforeUnmount(() => {
 .feed:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.loading {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: #6b7387;
 }
 
 .stats {

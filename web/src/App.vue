@@ -153,7 +153,7 @@ const stale = computed(() => lastAt.value > 0 && Date.now() - lastAt.value > 150
     </template>
 
     <SquatView v-else-if="tab === 'squat'" />
-    <PetView v-else-if="tab === 'pet'" :steps="sessionSteps" :last-at="lastAt" />
+    <PetView v-else-if="tab === 'pet'" :last-at="lastAt" />
   </div>
 </template>
 

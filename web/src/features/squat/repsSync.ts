@@ -28,6 +28,8 @@ export interface RepRowInput {
   /** 本次最深膝角（度） */
   minAngle: number
   durationMs: number
+  /** 归属设备，宠物触发器靠它把深蹲算到对应宠物头上 */
+  deviceId: string
 }
 
 export interface SaveResult {
@@ -48,6 +50,7 @@ export function createRepsWriter(supabaseUrl: string, supabaseAnonKey: string, t
         recorded_at: new Date(input.finishedAt).toISOString(),
         min_angle: Number(input.minAngle.toFixed(1)),
         duration_ms: Math.round(input.durationMs),
+        device_id: input.deviceId,
       })
 
       if (!error) return { outcome: 'ok' }

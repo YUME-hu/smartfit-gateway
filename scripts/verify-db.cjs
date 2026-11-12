@@ -159,10 +159,11 @@ async function main() {
     repPolNames.join(', ') || '(空)',
   )
 
-  // 幂等键：重复 client_key 必须被挡
+  // 幂等键：重复 client_key 必须被挡（device_id 显式给探测设备，
+  // 否则会默认落到 watch-01，把真实宠物的深蹲数刷上去）
   const repKey = `verify-probe:${Date.now()}:r1`
-  const insRep = `insert into public.reps (client_key, session_id, source, rep_index, recorded_at, min_angle, duration_ms)
-                  values ($1, 'verify-probe-session', 'vision', 1, now(), 95.5, 1600)`
+  const insRep = `insert into public.reps (client_key, session_id, source, rep_index, recorded_at, min_angle, duration_ms, device_id)
+                  values ($1, 'verify-probe-session', 'vision', 1, now(), 95.5, 1600, 'verify-probe-pet')`
   await client.query(insRep, [repKey])
   let repDupBlocked = false
   try {
@@ -172,12 +173,152 @@ async function main() {
   }
   check('reps 重复 client_key 被拒 (23505)', repDupBlocked)
 
+  // 9) pet_state：表 / 触发器 / RPC / publication
+  const petCols = await client.query(
+    `select column_name, is_generated, generation_expression
+       from information_schema.columns
+      where table_schema='public' and table_name='pet_state'`,
+  )
+  const petMap = new Map(petCols.rows.map((r) => [r.column_name, r]))
+  const needPet = ['device_id', 'steps_total', 'reps_total', 'bonus_exp', 'food_used', 'hunger', 'exp', 'food_earned']
+  const missPet = needPet.filter((c) => !petMap.has(c))
+  check('pet_state 字段齐全', missPet.length === 0, missPet.length ? '缺 ' + missPet.join(',') : `${needPet.length} 列`)
+
+  const expCol = petMap.get('exp')
+  const foodCol = petMap.get('food_earned')
+  check(
+    'exp / food_earned 是生成列（不是手写值）',
+    expCol?.is_generated === 'ALWAYS' && foodCol?.is_generated === 'ALWAYS',
+    expCol ? `exp=${expCol.is_generated}, food=${foodCol?.is_generated}` : '缺列',
+  )
+
+  const trg = await client.query(
+    `select tgname from pg_trigger
+      where not tgisinternal and tgrelid in ('public.imu_samples'::regclass, 'public.reps'::regclass)`,
+  )
+  const trgNames = trg.rows.map((r) => r.tgname)
+  check(
+    '步数/深蹲触发器已挂上',
+    trgNames.includes('trg_pet_bump_steps') && trgNames.includes('trg_pet_bump_reps'),
+    trgNames.join(', ') || '(无)',
+  )
+
+  const fns = await client.query(
+    `select proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname='public' and proname in ('get_pet_summary','feed_pet','add_bonus_exp')`,
+  )
+  const fnNames = fns.rows.map((r) => r.proname)
+  check('宠物 RPC 齐全', fnNames.length === 3, fnNames.join(', ') || '(无)')
+
+  const petPub = await client.query(
+    `select 1 from pg_publication_tables
+      where pubname='supabase_realtime' and schemaname='public' and tablename='pet_state'`,
+  )
+  check('pet_state 已加入 supabase_realtime', petPub.rowCount === 1)
+
+  // 功能级：插一条 250 步的样本，exp 应为 (250/100)*10 = 20
+  const petDev = 'verify-probe-pet'
+  const m = Date.now()
+  await client.query(
+    `insert into public.imu_samples (client_key, device_id, boot_epoch, seq, recorded_at, x, y, z, steps)
+     values ($1, $2, 0, 0, now(), 0, 0, 1, 250)`,
+    [`${petDev}:${m}`, petDev],
+  )
+  const s1 = await client.query('select public.get_pet_summary($1) as s', [petDev])
+  const sum1 = s1.rows[0].s
+  check(
+    '样本触发器累加步数并派生经验',
+    sum1.steps_total === 250 && sum1.exp === 20 && sum1.food_earned === 2,
+    `steps=${sum1.steps_total} exp=${sum1.exp} food=${sum1.food_earned}`,
+  )
+
+  // 再插一条 60 步的：累计 310 → exp 应为 30（而不是 20 + 0）
+  await client.query(
+    `insert into public.imu_samples (client_key, device_id, boot_epoch, seq, recorded_at, x, y, z, steps)
+     values ($1, $2, 0, 1, now(), 0, 0, 1, 60)`,
+    [`${petDev}:${m}b`, petDev],
+  )
+  const s2 = await client.query('select public.get_pet_summary($1) as s', [petDev])
+  check(
+    '经验按累计量派生（310 步 = 30 经验，不是每包累加）',
+    s2.rows[0].s.exp === 30,
+    `exp=${s2.rows[0].s.exp}`,
+  )
+
+  // 深蹲触发器：用"相对增量"断言，不依赖此前已插入多少行
+  const beforeRep = await client.query('select public.get_pet_summary($1) as s', [petDev])
+  const beforeReps = beforeRep.rows[0].s.reps_total
+
+  await client.query(
+    `insert into public.reps (client_key, session_id, source, rep_index, recorded_at, min_angle, duration_ms, device_id)
+     values ($1, 'verify-pet', 'vision', 1, now(), 95, 1500, $2)`,
+    [`${petDev}:r1`, petDev],
+  )
+  const s3 = await client.query('select public.get_pet_summary($1) as s', [petDev])
+  const petAfter = s3.rows[0].s
+  check(
+    '深蹲触发器累加 reps_total（+1）',
+    petAfter.reps_total === beforeReps + 1 && petAfter.reps_live === petAfter.reps_total,
+    `before=${beforeReps} after=${petAfter.reps_total} live=${petAfter.reps_live}`,
+  )
+
+  // 喂食
+  const feed = await client.query('select public.feed_pet($1) as s', [petDev])
+  const fed = feed.rows[0].s
+  check(
+    'feed_pet 消耗食物且恢复饱食度',
+    fed.ok === true && fed.food_used === 1 && fed.hunger > 79,
+    `ok=${fed.ok} used=${fed.food_used} hunger=${fed.hunger}`,
+  )
+
+  // 奖励经验
+  const bonus = await client.query('select public.add_bonus_exp($1, 100) as s', [petDev])
+  check('add_bonus_exp 只加 bonus_exp', bonus.rows[0].s.exp === 130 && bonus.rows[0].s.steps_total === 310,
+    `exp=${bonus.rows[0].s.exp} steps=${bonus.rows[0].s.steps_total}`)
+
+  // 9.1 对账：pet_state 的累计量必须等于源表重算结果
+  //     （实测踩过：db push 回填时 reps 里还有测试行，回填把 1 算进了 reps_total，
+  //      之后测试行被清掉，pet_state 却停在了 1 —— 这类漂移必须能被检查出来）
+  const drift = await client.query(`
+    select ps.device_id,
+           ps.steps_total,
+           coalesce((select sum(steps) from public.imu_samples i where i.device_id = ps.device_id), 0)::bigint as src_steps,
+           ps.reps_total,
+           coalesce((select count(*) from public.reps r where r.device_id = ps.device_id), 0)::bigint as src_reps
+      from public.pet_state ps
+  `)
+  const drifted = drift.rows.filter(
+    (r) => Number(r.steps_total) !== Number(r.src_steps) || Number(r.reps_total) !== Number(r.src_reps),
+  )
+  check(
+    'pet_state 与源表对账一致',
+    drifted.length === 0,
+    drifted.length ? JSON.stringify(drifted) : `${drift.rowCount} 台设备`,
+  )
+
   // 清理
   const del = await client.query(`delete from public.imu_samples where device_id = 'verify-probe'`)
   const del2 = await client.query(
     `delete from public.device_latest where device_id = 'verify-probe' or device_id like 'rt-probe-%'`,
   )
   const del3 = await client.query(`delete from public.reps where session_id = 'verify-probe-session'`)
+  const del4 = await client.query(`delete from public.reps where device_id = 'verify-probe-pet'`)
+  const del5 = await client.query(`delete from public.imu_samples where device_id = 'verify-probe-pet'`)
+  const del6 = await client.query(`delete from public.pet_state where device_id = 'verify-probe-pet'`)
+
+  // 清理源数据后必须对账，否则 pet_state 会留下增量残值
+  // （这是计数器表的通病：源表删了，累计量不会自己回退）
+  await client.query(`
+    delete from public.pet_state ps
+     where ps.device_id like 'verify-probe%'
+       and not exists (select 1 from public.imu_samples i where i.device_id = ps.device_id)
+       and not exists (select 1 from public.reps r where r.device_id = ps.device_id)`)
+  await client.query(`
+    update public.pet_state ps
+       set steps_total = coalesce((select sum(steps) from public.imu_samples i where i.device_id = ps.device_id), 0),
+           reps_total  = coalesce((select count(*)  from public.reps r where r.device_id = ps.device_id), 0),
+           updated_at  = now()
+     where ps.device_id not like 'verify-probe%'`)
   const left = await client.query(
     `select count(*)::int as n from public.imu_samples where device_id = 'verify-probe'`,
   )

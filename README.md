@@ -165,6 +165,83 @@ canvas 1102×380 采样到 551 个非背景像素，确认图表真的绘制了�
 4. 判定参数（160/100/600ms）是按常规深蹲节奏定的，**不同人身高/柔韧度需要微调**，
    改 `DEFAULT_SQUAT_CONFIG` 即可。
 
+## 数字生命养成（`web/src/features/pet/`）
+
+第三个 Tab。宠物状态**持久化在云端**，刷新/换浏览器/手机重同步都不丢。
+
+### 数据流（服务端权威）
+
+```
+imu_samples 插入（每 5 秒一条，含 steps） ──┐
+                                          ├─▶ 触发器累加 steps_total / reps_total
+reps 插入（每完成一个深蹲一行）      ──────┘            │
+                                                      ▼
+                                            pet_state（exp 是生成列）
+                                                      │ Realtime
+                                                      ▼
+                                            Web 宠物页实时更新
+```
+
+前端**不直接写表**，只调三个 RPC：
+
+| RPC | 用途 |
+| --- | --- |
+| `get_pet_summary(device_id)` | 读状态（含按时间衰减后的饱食度、实时深蹲计数） |
+| `feed_pet(device_id)` | 喂食：消耗 1 食物，饱食度 +20 |
+| `add_bonus_exp(device_id, delta)` | 奖励经验（演示/成就用） |
+
+### 为什么 exp 必须是生成列
+
+"每 100 步给 10 经验"**不是可加量**：
+
+```
+floor(310 / 100) * 10 = 30      ← 正确
+floor(250 / 100) * 10 + floor(60 / 100) * 10 = 20   ← 按包累加会少算
+```
+
+批同步可能把步数拆成多包入库。所以表里存累计量，`exp` 由它派生：
+
+```sql
+exp         integer generated always as ((steps_total / 100) * 10 + (reps_total / 10) * 15 + bonus_exp) stored
+food_earned integer generated always as ((steps_total / 100) + (reps_total / 10) * 2) stored
+```
+
+实测验证：250 步 → 20 经验；再插 60 步（累计 310）→ **30 经验**，不是 20。
+
+### 计数器的通病：必须能对账
+
+触发器只对"创建之后"的插入生效，而**删源数据不会回退累计量**。这个坑实际踩了两次：
+
+1. 迁移上线时，之前的 282 条历史样本没被算进去 → 补了 `20261112151000_pet_backfill.sql`
+2. 验证脚本删测试数据后，`pet_state` 留下了 +1 的残值 → 清理后必须跑对账
+
+所以 `verify-db.cjs` 里有一条硬检查：
+
+```
+pet_state.steps_total == (select sum(steps) from imu_samples where device_id = ...)
+pet_state.reps_total  == (select count(*)   from reps         where device_id = ...)
+```
+
+漂移会直接 FAIL。手工对账命令（幂等）：
+
+```sql
+update public.pet_state ps
+   set steps_total = coalesce((select sum(steps) from public.imu_samples i where i.device_id = ps.device_id), 0),
+       reps_total  = coalesce((select count(*)  from public.reps r where r.device_id = ps.device_id), 0),
+       updated_at  = now();
+```
+
+### 进化动画
+
+`PetAvatar.vue` 用 `phase` 状态机（`idle → shake → flash → reveal → jump`）跑四段编舞，
+换图时机放在白光最亮处（800ms），避免硬切。只有 `stage` **变大**才触发（Lv1→2、Lv3→4）。
+
+### 已知限制
+
+1. `add_bonus_exp` 对 anon 开放，方便答辩手动推进等级——**正式上线应改成需要鉴权**。
+2. 目前是单设备模型（`VITE_DEVICE_ID`），多用户需要接 Supabase Auth 把 `device_id` 绑到 `auth.uid()`。
+3. 饥饿度衰减是在读取时按 `hunger_at` 时间差算的，没有后台定时任务，所以**不打开页面也不会"饿死"**（只在读数时结算）。
+
 ## 完整演示流程（Demo Flow）
 
 答辩现场按这个顺序，任何一步跳过都会让后面看起来"没数据"。
