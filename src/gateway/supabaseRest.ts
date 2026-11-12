@@ -114,18 +114,28 @@ export class SupabaseRest {
 
   private post(path: string, body: unknown, prefer: string[]): Promise<HttpResult> {
     const url = this.opts.url.replace(/\/+$/, '') + path
+    const key = this.opts.anonKey
+
+    const header: Record<string, string> = {
+      apikey: key,
+      'Content-Type': 'application/json',
+      Prefer: prefer.join(','),
+    }
+
+    // 老式 anon key 是 JWT（eyJ...），放 Authorization 里是标准做法。
+    // 新版 publishable key（sb_publishable_...）不是 JWT，部分网关会把
+    // 非 JWT 的 Bearer 判成非法 token —— 实测当前项目容错，但这里只对
+    // JWT 形态才加 Bearer，避免以后换网关时踩坑。
+    if (key.startsWith('eyJ')) {
+      header.Authorization = `Bearer ${key}`
+    }
 
     return new Promise<HttpResult>((resolve, reject) => {
       uni.request({
         url,
         method: 'POST',
         timeout: this.timeoutMs,
-        header: {
-          apikey: this.opts.anonKey,
-          Authorization: `Bearer ${this.opts.anonKey}`,
-          'Content-Type': 'application/json',
-          Prefer: prefer.join(','),
-        },
+        header,
         // 传字符串而不是对象：避免各端对对象的默认序列化行为不一致
         data: JSON.stringify(body),
         success: (res: { statusCode: number; data: unknown }) => {
