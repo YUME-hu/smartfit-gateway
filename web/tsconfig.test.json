@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".tmp/js",
+    "rootDir": "src",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "types": []
+  },
+  "include": ["src/features/squat/squatCounter.ts", "src/features/squat/poseMath.ts", "src/features/squat/types.ts"]
+}

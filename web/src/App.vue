@@ -10,9 +10,13 @@
  * 要真正的日累计，需要服务端做聚合视图（见 README）。
  */
 
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import LiveChart from './components/LiveChart.vue'
+import SquatView from './features/squat/SquatView.vue'
 import { useDeviceLatest } from './composables/useDeviceLatest'
+
+/** 顶部 Tab：实时数据看板 / 深蹲识别（不引 vue-router，减少一层依赖） */
+const tab = ref<'data' | 'squat'>('data')
 
 const env = import.meta.env
 const supabaseUrl = env.VITE_SUPABASE_URL as string | undefined
@@ -62,6 +66,16 @@ const stale = computed(() => lastAt.value > 0 && Date.now() - lastAt.value > 150
 
 <template>
   <div class="page">
+    <nav class="app-tabs">
+      <button :class="['app-tab', { active: tab === 'data' }]" @click="tab = 'data'">
+        实时数据
+      </button>
+      <button :class="['app-tab', { active: tab === 'squat' }]" @click="tab = 'squat'">
+        深蹲识别
+      </button>
+    </nav>
+
+    <template v-if="tab === 'data'">
     <header class="topbar">
       <div class="brand">
         <span class="dot" :class="{ live: isLive }"></span>
@@ -132,10 +146,43 @@ const stale = computed(() => lastAt.value > 0 && Date.now() - lastAt.value > 150
         <strong>不是全天总计</strong>；全天统计需要服务端聚合视图。
       </p>
     </footer>
+    </template>
+
+    <SquatView v-else-if="tab === 'squat'" />
   </div>
 </template>
 
 <style scoped>
+.app-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 18px;
+  border-bottom: 1px solid #1f232c;
+  padding-bottom: 12px;
+}
+
+.app-tab {
+  background: transparent;
+  border: 1px solid #2b2f3a;
+  color: #8b93a7;
+  border-radius: 999px;
+  padding: 7px 18px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.app-tab:hover {
+  color: #c7cede;
+  border-color: #3a4050;
+}
+
+.app-tab.active {
+  background: rgba(61, 126, 255, 0.14);
+  border-color: #3d7eff;
+  color: #fff;
+}
+
 .page {
   max-width: 1180px;
   margin: 0 auto;

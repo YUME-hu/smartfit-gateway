@@ -96,6 +96,75 @@ canvas 1102×380 采样到 551 个非背景像素，确认图表真的绘制了�
 > 而 `curl` / Node 不读系统代理所以一直正常。如果页面在浏览器里连不上而
 > 命令行能通，先看「设置 → 网络 → 代理」。
 
+## 深蹲识别（MediaPipe，`web/src/features/squat/`）
+
+看板顶部第二个 Tab。笔记本摄像头实时识别，另带**上传本地视频离线分析**作为答辩兜底。
+
+### 资源全部同源，不碰任何 CDN
+
+官方示例默认从 `storage.googleapis.com` / `cdn.jsdelivr.net` 拉 wasm 和模型，
+国内大概率不通。这里全部落在 `web/public/`：
+
+| 资源 | 来源 | 是否入库 |
+| --- | --- | --- |
+| `public/wasm/*`（4 个文件，28 MB） | `npm run prepare:assets` 从 `@mediapipe/tasks-vision` 复制 | ❌ 由 `npm install` 可复现，不入库 |
+| `public/models/pose_landmarker_lite.task`（5.5 MB） | 一次性下载 | ✅ 入库 |
+
+`dev` / `build` 脚本会自动先跑 `prepare:assets`，所以只要 `npm install` 过就不会缺文件。
+浏览器实测三个请求都打到 `localhost:5199`，零外网。
+
+### 判定算法（纯函数 + 16 条单测）
+
+`squatCounter.ts` / `poseMath.ts` 不依赖 DOM 与 MediaPipe，可被 `node --test` 直接测。
+
+```
+站立(≥160°) ──▶ 下蹲中 ──▶ 蹲底(≤100°) ──▶ 起身中 ──▶ 站立
+                                              │
+                                   到过蹲底 + 时长≥0.6s 才 +1
+```
+
+- **双阈值滞回**：160° 与 100° 之间 60° 死区，人站着微抖不会刷数
+- **最短时长 0.6s**：过滤摄像头抖动与快速抬腿
+- **必须真的到过蹲底**：浅蹲 / 半蹲不计
+- **可见度门控**：髋-膝-踝三点都要 ≥0.5 可见才采用该侧；两侧都不可用就**暂停计数**
+- 两侧都可见时取两侧膝角平均，侧身拍摄时自动退化为单侧
+
+单测覆盖：完整深蹲、浅蹲不计数、阈值抖动 30 次不刷数、动作过快不计数、
+连续两次 repIndex 递增、跳帧级联、中途回蹲、NaN 输入、状态机不可变、
+角度计算、单侧遮挡、关键点缺失。跑 `cd web && npm test`。
+
+### 两种模式
+
+| 模式 | 用途 | 说明 |
+| --- | --- | --- |
+| 实时摄像头 | 答辩主展示 | `getUserMedia`，前置摄像头画面做镜像（CSS `scaleX(-1)`，骨架同步镜像） |
+| 上传视频 | 防翻车兜底 | 选本地视频文件 → 播放一遍分析，不依赖现场光线与摄像头权限 |
+
+### 数据落库
+
+每次动作完成写一行 `reps`（迁移 `20261112140000`）：
+
+| 列 | 说明 |
+| --- | --- |
+| `client_key` | 幂等键 `session_id:rep_index`，唯一约束挡重复 |
+| `session_id` | 一次训练会话，前端生成；可与同时段手表数据按时间对齐 |
+| `source` | `vision`（视觉）/ `imu`（手表） |
+| `rep_index` | 第几次 |
+| `recorded_at` | 完成时刻（需求里的 `ts`） |
+| `min_angle` | 本次最深膝角，深蹲质量指标 |
+| `duration_ms` | 动作时长 |
+
+写入用**普通 INSERT + 把 23505 当成功**，不用 `Prefer: resolution=...`
+（原因见下文「坑 1」）。
+
+### 已知限制
+
+1. 摄像头要求 **localhost 或 HTTPS**，`http://192.168.x.x` 访问会拿不到摄像头。
+2. 侧面拍摄最准；正面对髋踝遮挡多，容易丢关键点。
+3. lite 模型在普通笔记本上约 15~20 FPS，够用；追求精度可换 `pose_landmarker_full`。
+4. 判定参数（160/100/600ms）是按常规深蹲节奏定的，**不同人身高/柔韧度需要微调**，
+   改 `DEFAULT_SQUAT_CONFIG` 即可。
+
 ## 完整演示流程（Demo Flow）
 
 答辩现场按这个顺序，任何一步跳过都会让后面看起来"没数据"。
@@ -137,6 +206,11 @@ canvas 1102×380 采样到 551 个非背景像素，确认图表真的绘制了�
 App 上「待上传」清零、「已上传」增加、「上次同步」变为当前时间。
 切到 Supabase 控制台 `imu_samples` 表，能看到刚落库的行
 （建议提前开好这个标签页，效果最好）。
+
+**⑤′ 切到「深蹲识别」Tab**（可选，30s）
+
+在笔记本前做 3~5 个深蹲，页面实时显示骨架、膝角、状态与计数。
+如果现场光线或摄像头不给力，**立刻切「上传视频分析」**，用事先录好的视频兜底。
 
 **⑥ 收尾讲解**
 
@@ -267,9 +341,19 @@ app-gateway/
 ├─ components/MiniChart.vue       原生 canvas 折线/柱状图（零依赖，App 用）
 ├─ pages/gateway/index.vue        演示页：步数主视觉 + 双图表 + 立即同步
 ├─ web/                           ★ Vite + Vue3 实时看板（ECharts）
-│  ├─ src/App.vue                 KPI 卡片 + 图表 + 状态
+│  ├─ src/App.vue                 Tab 外壳：实时数据 / 深蹲识别
 │  ├─ src/components/LiveChart.vue ECharts 薄封装（按需引入）
 │  ├─ src/composables/useDeviceLatest.ts  Realtime 订阅 + 去重 + 滚动缓冲
+│  ├─ src/features/squat/         深蹲识别
+│  │  ├─ squatCounter.ts          状态机（纯函数）
+│  │  ├─ poseMath.ts              膝角计算 + 左右侧选择（纯函数）
+│  │  ├─ usePoseLandmarker.ts     MediaPipe 加载/推理（同源、GPU→CPU 兜底）
+│  │  ├─ drawSkeleton.ts          骨架绘制
+│  │  ├─ repsSync.ts              写 reps 表（23505 视为成功）
+│  │  └─ SquatView.vue            摄像头/视频双模式 UI
+│  ├─ public/models/              pose_landmarker_lite.task（入库）
+│  ├─ public/wasm/                MediaPipe wasm（脚本生成，不入库）
+│  ├─ tests/squatCounter.test.cjs 16 条算法单测
 │  └─ vite.config.ts              dev 端口 5199
 ├─ firmware/                      ESP32 固件（计步 + BLE）
 ├─ supabase/migrations/           Supabase CLI 迁移（唯一 schema 来源）
@@ -399,7 +483,8 @@ Web 看板：
 
 ```bash
 cd web
-npm run dev        # http://localhost:5199
+npm run dev        # http://localhost:5199（自动准备 wasm/模型）
 npm run typecheck  # vue-tsc
+npm test           # 深蹲算法 16 条单测
 npm run build      # 产物 web/dist
 ```

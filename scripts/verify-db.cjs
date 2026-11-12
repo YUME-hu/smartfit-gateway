@@ -133,11 +133,51 @@ async function main() {
   const r3 = await client.query('select public.ingest_samples($1::jsonb) as n', [mixed])
   check('混合批次只写入新行（重复的跳过）', r3.rows[0].n === 1, `返回 ${r3.rows[0].n}`)
 
-  // 清理（verify-probe 是本脚本的，rt-probe 是 Realtime 诊断脚本的）
+  // 8) reps 表（Web 端深蹲识别写入）
+  const repCols = await client.query(
+    `select column_name from information_schema.columns
+      where table_schema='public' and table_name='reps'`,
+  )
+  const repSet = new Set(repCols.rows.map((r) => r.column_name))
+  const needRep = ['client_key', 'session_id', 'source', 'rep_index', 'recorded_at', 'min_angle', 'duration_ms']
+  const missRep = needRep.filter((c) => !repSet.has(c))
+  check('reps 表字段齐全', missRep.length === 0, missRep.length ? '缺 ' + missRep.join(',') : `${needRep.length} 列`)
+
+  const repRls = await client.query(
+    `select relrowsecurity from pg_class
+      where relname='reps' and relnamespace='public'::regnamespace`,
+  )
+  check('reps 已开启 RLS', repRls.rows[0]?.relrowsecurity === true)
+
+  const repPol = await client.query(
+    `select policyname from pg_policies where schemaname='public' and tablename='reps'`,
+  )
+  const repPolNames = repPol.rows.map((r) => r.policyname)
+  check(
+    'reps 策略齐全（anon 可写 / authenticated 可读）',
+    repPolNames.includes('gateway insert reps') && repPolNames.includes('authenticated read reps'),
+    repPolNames.join(', ') || '(空)',
+  )
+
+  // 幂等键：重复 client_key 必须被挡
+  const repKey = `verify-probe:${Date.now()}:r1`
+  const insRep = `insert into public.reps (client_key, session_id, source, rep_index, recorded_at, min_angle, duration_ms)
+                  values ($1, 'verify-probe-session', 'vision', 1, now(), 95.5, 1600)`
+  await client.query(insRep, [repKey])
+  let repDupBlocked = false
+  try {
+    await client.query(insRep, [repKey])
+  } catch (e) {
+    repDupBlocked = e.code === '23505'
+  }
+  check('reps 重复 client_key 被拒 (23505)', repDupBlocked)
+
+  // 清理
   const del = await client.query(`delete from public.imu_samples where device_id = 'verify-probe'`)
   const del2 = await client.query(
     `delete from public.device_latest where device_id = 'verify-probe' or device_id like 'rt-probe-%'`,
   )
+  const del3 = await client.query(`delete from public.reps where session_id = 'verify-probe-session'`)
   const left = await client.query(
     `select count(*)::int as n from public.imu_samples where device_id = 'verify-probe'`,
   )
