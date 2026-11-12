@@ -1,0 +1,180 @@
+# =============================================================================
+# uni-app → Android APK（离线打包）
+#
+# ⚠️ 放置位置：GitHub Actions 只认仓库根目录的 .github/workflows/。
+#    如果 app-gateway 就是仓库根，这个路径已经正确；
+#    如果它是一个子目录，把本文件移到仓库根的 .github/workflows/ 下，
+#    并把下面所有 `working-directory` 改成你的子目录。
+#
+# 为什么走「离线打包」而不是 DCloud 云打包：
+#   云打包需要在 CI 里登录 DCloud 账号并走厂商后端，账号凭证与配额都不可控；
+#   离线打包是官方支持的本地 Gradle 流程，产物可复现。
+#
+# 前置条件（缺一不可，否则一定会失败）：
+#   1. 项目必须是 **CLI 工程**（有 package.json 和 @dcloudio/* 依赖）。
+#      HBuilderX 里"新建的空项目"没有 package.json，CLI 无法构建。
+#      用 `npx degit dcloudio/uni-preset-vue#vite-ts my-app` 创建，
+#      再把 src/gateway、pages、components 拷进去。
+#   2. 必须提供 DCloud Android 离线 SDK 的下载直链（变量 ANDROID_SDK_URL），
+#      版本必须与 package.json 里 @dcloudio 各包版本**一致**，否则启动白屏。
+#   3. 需要签名密钥（secrets.ANDROID_KEYSTORE_BASE64 等）。
+# =============================================================================
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  # DCloud 应用的 appid，必须与 manifest.json 里的 "appid" 完全一致（形如 __UNI__A1B2C3D）
+  APP_ID: ${{ vars.UNI_APP_ID }}
+  # Android 离线 SDK 的 zip 直链（建议自建对象存储或 Release 附件，别依赖第三方网盘）
+  ANDROID_SDK_URL: ${{ vars.ANDROID_SDK_URL }}
+  # SDK 解压后 Gradle 工程所在目录（不同版本路径不同，按实际调整）
+  GRADLE_PROJECT: ${{ vars.GRADLE_PROJECT }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1：编译 uni-app 前端产物。
+  # 不依赖任何 DCloud 私有资源，因此总是能跑，用来第一时间发现"代码编译不过"。
+  # ---------------------------------------------------------------------------
+  build-assets:
+    name: 编译 uni-app 产物
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: 安装依赖
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: 注入 .env（VITE_ 变量会被打进包，只放 anon key）
+        run: |
+          cat > .env <<'EOF'
+          VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_DEVICE_ID=${{ vars.VITE_DEVICE_ID }}
+          EOF
+
+      - name: 构建 App 端资源
+        run: npm run build:app
+
+      - name: 校验产物存在
+        run: |
+          set -e
+          test -d dist/build/app || { echo "dist/build/app 不存在，检查 package.json 的 build:app 脚本"; exit 1; }
+          echo "产物大小："
+          du -sh dist/build/app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uni-app-assets
+          path: dist/build/app
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 2：把上面的产物塞进 DCloud 离线 SDK，Gradle 打出 APK。
+  # 缺变量时跳过而不是失败 —— 这样只配了 Supabase secret 的人也能用 Job 1。
+  # ---------------------------------------------------------------------------
+  package-apk:
+    name: 打包 APK
+    needs: build-assets
+    if: ${{ vars.ANDROID_SDK_URL != '' && vars.UNI_APP_ID != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: 安装依赖
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
+
+      - name: 注入 .env
+        run: |
+          cat > .env <<'EOF'
+          VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_DEVICE_ID=${{ vars.VITE_DEVICE_ID }}
+          EOF
+
+      - name: 构建 App 端资源
+        run: npm run build:app
+
+      - name: 下载并解压 Android 离线 SDK
+        run: |
+          set -e
+          SDK_ZIP=$RUNNER_TEMP/dcloud-sdk.zip
+          curl -fL --retry 3 --retry-delay 5 -o "$SDK_ZIP" "$ANDROID_SDK_URL"
+          mkdir -p "$RUNNER_TEMP/sdk"
+          unzip -q "$SDK_ZIP" -d "$RUNNER_TEMP/sdk"
+          echo "SDK 顶层目录："
+          ls -la "$RUNNER_TEMP/sdk"
+
+      - name: 把前端产物放进 SDK 的 assets
+        run: |
+          set -e
+          TARGET="$RUNNER_TEMP/sdk/$GRADLE_PROJECT/app/src/main/assets/apps/$APP_ID"
+          mkdir -p "$TARGET"
+          cp -r dist/build/app "$TARGET/www"
+          # appid 必须与 SDK 里的 dcloud_control.xml 一致，否则启动白屏
+          find "$RUNNER_TEMP/sdk/$GRADLE_PROJECT" -name dcloud_control.xml -print -exec cat {} \;
+          echo "已写入 $TARGET/www"
+
+      - name: 恢复签名密钥
+        run: |
+          set -e
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          cat > "$RUNNER_TEMP/keystore.properties" <<EOF
+          storeFile=$RUNNER_TEMP/release.keystore
+          storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+          echo "签名文件已就绪（未回显密码）"
+
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 打包
+        working-directory: ${{ runner.temp }}/sdk/${{ env.GRADLE_PROJECT }}
+        run: |
+          set -e
+          chmod +x gradlew || true
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: 收集并重命名 APK
+        run: |
+          set -e
+          SRC=$(find "$RUNNER_TEMP/sdk/$GRADLE_PROJECT" -name "*-release*.apk" | head -n 1)
+          test -n "$SRC" || { echo "没找到 APK，检查 Gradle 输出"; exit 1; }
+          mkdir -p out
+          cp "$SRC" "out/fitness-watch-${GITHUB_SHA::7}.apk"
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: out/*.apk
+          retention-days: 14

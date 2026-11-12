@@ -1,0 +1,22 @@
+{
+  "name": "app-gateway",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "ESP32 手表 → 手机网关 → Supabase → Vue3 看板",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:test": "tsc -p tsconfig.build.json",
+    "check:sfc": "node scripts/check-sfc.cjs",
+    "verify": "npm run typecheck && npm run check:sfc && npm test",
+    "test": "npm run build:test && node --test tests/gateway.test.cjs"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "typescript": "^5.6.0",
+    "vue": "^3.5.0"
+  },
+  "dependencies": {
+    "js-yaml": "^5.5.0"
+  }
+}
