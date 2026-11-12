@@ -96,7 +96,8 @@ async function onRepDone(rep: RepEvent): Promise<void> {
     clientKey: `${sessionId}:${rep.repIndex}`,
     sessionId,
     repIndex: rep.repIndex,
-    finishedAt: rep.finishedAt,
+    // 用墙钟时间入库；rep.finishedAt 是 performance.now()，只适合算时长
+    finishedAt: Date.now(),
     minAngle: rep.minAngle,
     durationMs: rep.durationMs,
   })

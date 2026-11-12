@@ -30,12 +30,19 @@ export interface SquatConfig {
   bottomAngle: number
   /** 一次动作的最短时长（ms），即"冷却时间" */
   minRepMs: number
+  /**
+   * 一次动作的最长时长（ms）。
+   * 实测教训：没有这个上限时，人走出画面、两分钟后回来站直，
+   * 会被算成一次"深蹲"，库里出现 duration=126809ms 的假记录。
+   */
+  maxRepMs: number
 }
 
 export const DEFAULT_SQUAT_CONFIG: SquatConfig = {
   standAngle: 160,
   bottomAngle: 100,
   minRepMs: 600,
+  maxRepMs: 8000,
 }
 
 export interface SquatState {
@@ -86,6 +93,11 @@ export function feedSquatAngle(
 
   let s: SquatState = state
   let rep: RepEvent | null = null
+
+  // 超时保护：动作拖太久说明人已经不在做动作了（走开/画面丢失），直接作废
+  if (s.phase !== 'standing' && s.repStartedAt !== null && nowMs - s.repStartedAt > cfg.maxRepMs) {
+    s = { ...s, phase: 'standing', repStartedAt: null, minAngleInRep: 180, reachedBottom: false }
+  }
 
   for (let guard = 0; guard < 4; guard++) {
     const before = s.phase

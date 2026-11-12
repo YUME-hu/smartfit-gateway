@@ -19,7 +19,11 @@ export interface RepRowInput {
   clientKey: string
   sessionId: string
   repIndex: number
-  /** epoch ms */
+  /**
+   * 完成时刻，**必须是墙钟 epoch ms**（Date.now()）。
+   * 别传 performance.now()：那是页面启动后的相对毫秒数，
+   * 直接 new Date() 会得到 1970 年（实测踩过，库里出现 1970-01-01）。
+   */
   finishedAt: number
   /** 本次最深膝角（度） */
   minAngle: number

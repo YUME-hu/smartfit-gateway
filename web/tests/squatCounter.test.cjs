@@ -128,6 +128,52 @@ test('恰好 600ms 的动作算数（边界包含）', () => {
   assert.equal(s.reps, 1)
 })
 
+test('动作拖超过 8 秒 → 作废，不计数（人已走开）', () => {
+  let s = createSquatState()
+  let rep = null
+
+  ;({ state: s } = feedSquatAngle(s, 170, 0, cfg))
+  ;({ state: s } = feedSquatAngle(s, 90, 300, cfg))
+  // 实测踩过：人走出画面两分钟后回来站直，被算成一次 126 秒的深蹲
+  ;({ state: s, rep } = feedSquatAngle(s, 170, 12300, cfg))
+
+  assert.equal(rep, null, '超时的动作必须作废')
+  assert.equal(s.reps, 0)
+  assert.equal(s.phase, 'standing')
+})
+
+test('恰好 8 秒的动作仍算数（maxRepMs 边界）', () => {
+  let s = createSquatState()
+  let rep = null
+
+  ;({ state: s } = feedSquatAngle(s, 170, 0, cfg))
+  ;({ state: s } = feedSquatAngle(s, 90, 1000, cfg))
+  ;({ state: s, rep } = feedSquatAngle(s, 170, 9000, cfg))
+
+  assert.notEqual(rep, null)
+  assert.equal(rep.durationMs, 8000)
+})
+
+test('超时作废后，下一次动作仍能正常计数', () => {
+  let s = createSquatState()
+  let reps = 0
+
+  const feed = (angle, t) => {
+    const r = feedSquatAngle(s, angle, t, cfg)
+    s = r.state
+    if (r.rep) reps++
+  }
+
+  feed(170, 0)
+  feed(90, 300)
+  feed(170, 12300) // 作废这次
+  feed(90, 13000)
+  feed(170, 14000) // 正常一次
+
+  assert.equal(reps, 1)
+  assert.equal(s.reps, 1)
+})
+
 test('一帧从 170° 直接跳到 90°，仍能进入蹲底（级联转移）', () => {
   let s = createSquatState()
   ;({ state: s } = feedSquatAngle(s, 170, 0, cfg))
