@@ -1,0 +1,12 @@
+{
+  "name": "smartfit-contracts",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SmartFit 里程碑成就 SBT",
+  "scripts": {
+    "compile": "node compile.cjs"
+  },
+  "devDependencies": {
+    "solc": "^0.8.24"
+  }
+}

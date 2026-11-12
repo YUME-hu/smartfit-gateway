@@ -20,6 +20,7 @@ import {
 } from './petRules'
 import type { PetMood } from './petRules'
 import { usePetState } from './usePetState'
+import { useAchievementMint } from '../chain/useAchievementMint'
 
 const props = defineProps<{
   /** 最近一次收到手表数据的时刻，用于判断"正在运动" */
@@ -42,6 +43,46 @@ const {
   addBonusExp,
   recordSquat,
 } = usePetState({ supabaseUrl, supabaseAnonKey: supabaseKey, deviceId: DEVICE_ID, enabled })
+
+// ---------------------------------------------------------------- 上链
+
+const CONTRACT = (env.VITE_ACHIEVEMENT_CONTRACT as string | undefined) ?? ''
+const MIN_EXP = 300
+const MIN_STEPS = 5000
+
+const {
+  account,
+  chainId,
+  phase,
+  error: mintError,
+  txHash,
+  tokenId,
+  alreadyMinted,
+  hasWallet,
+  onSepolia,
+  contractReady,
+  connect,
+  switchToSepolia,
+  mint,
+} = useAchievementMint({ contractAddress: CONTRACT, minExp: MIN_EXP, minSteps: MIN_STEPS })
+
+/** 达标条件：经验 ≥300 或累计步数 ≥5000（合约里也校验一遍，这里是 UX） */
+const eligible = computed(() => exp.value >= MIN_EXP || stepsTotal.value >= MIN_STEPS)
+
+function short(v: string | null | undefined): string {
+  if (!v) return '—'
+  return v.length > 12 ? `${v.slice(0, 6)}…${v.slice(-4)}` : v
+}
+
+async function onMint(): Promise<void> {
+  await mint(totalExpForMint(), stepsTotal.value, progress.value.level)
+  if (!mintError.value) log('已提交上链交易')
+}
+
+/** mint 用的经验值（避免和模板里的表达式重复计算） */
+function totalExpForMint(): number {
+  return summary.value?.exp ?? 0
+}
 
 // ---------------------------------------------------------------- 本地 UI 状态
 
@@ -252,6 +293,49 @@ onBeforeUnmount(() => {
         <span class="v">{{ stageText }}</span>
         <span class="s">Lv4 起进入成熟体</span>
       </div>
+    </section>
+
+    <section class="card chain">
+      <div class="chain-head">
+        <h3>里程碑成就（SBT）</h3>
+        <span class="chain-tag" :class="{ on: eligible }">{{ eligible ? '已达标' : '未达标' }}</span>
+      </div>
+      <p class="chain-desc">
+        经验 ≥ {{ MIN_EXP }} 或累计步数 ≥ {{ MIN_STEPS }} 可上链领取。一人一枚、不可转让（Soulbound）。
+      </p>
+      <ul class="chain-rows">
+        <li><span>合约</span><code>{{ contractReady ? short(CONTRACT) : '未配置合约地址' }}</code></li>
+        <li><span>钱包</span><code>{{ account ? short(account) : hasWallet ? '未连接' : '未安装 MetaMask' }}</code></li>
+        <li><span>网络</span><code>{{ onSepolia ? 'Sepolia ✓' : chainId ? `chainId ${chainId}` : '—' }}</code></li>
+      </ul>
+
+      <div class="chain-actions">
+        <button v-if="!account" :disabled="!hasWallet || !contractReady" @click="connect">
+          连接钱包
+        </button>
+        <button v-else-if="!contractReady" disabled>未配置合约地址</button>
+        <button v-else-if="!onSepolia" @click="switchToSepolia">切到 Sepolia</button>
+        <button
+          v-else-if="!alreadyMinted"
+          class="mint"
+          :disabled="!eligible || phase === 'signing' || phase === 'pending'"
+          @click="onMint"
+        >
+          {{ phase === 'signing' ? '等待钱包确认…' : phase === 'pending' ? '上链中…' : '上链铭刻' }}
+        </button>
+        <span v-else class="minted">已领取 #{{ tokenId ?? '—' }}</span>
+      </div>
+
+      <p v-if="mintError" class="chain-err">{{ mintError }}</p>
+      <a
+        v-if="txHash"
+        class="chain-link"
+        :href="`https://sepolia.etherscan.io/tx/${txHash}`"
+        target="_blank"
+        rel="noreferrer noopener"
+      >
+        在 Sepolia Etherscan 查看交易 {{ short(txHash) }}
+      </a>
     </section>
 
     <section class="card">
@@ -486,6 +570,115 @@ onBeforeUnmount(() => {
   font-size: 14px;
   color: #c7cede;
   font-weight: 600;
+}
+
+/* ---------------- 上链卡片 ---------------- */
+
+.chain-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.chain-head h3 {
+  margin: 0;
+}
+
+.chain-tag {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid #2b2f3a;
+  color: #6b7387;
+}
+
+.chain-tag.on {
+  color: #3ddc84;
+  border-color: rgba(61, 220, 132, 0.5);
+  background: rgba(61, 220, 132, 0.1);
+}
+
+.chain-desc {
+  font-size: 12px;
+  color: #6b7387;
+  line-height: 1.7;
+  margin: 0 0 10px;
+}
+
+.chain-rows {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chain-rows li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: #8b93a7;
+}
+
+.chain-rows code {
+  font-family: monospace;
+  color: #c7cede;
+  background: #12151c;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.chain-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.chain-actions button {
+  flex: 1;
+  background: transparent;
+  border: 1px solid #2b2f3a;
+  color: #c7cede;
+  border-radius: 10px;
+  padding: 9px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.chain-actions button.mint {
+  background: linear-gradient(90deg, rgba(61, 126, 255, 0.2), rgba(61, 220, 132, 0.2));
+  border-color: #3d7eff;
+  color: #fff;
+  font-weight: 600;
+}
+
+.chain-actions button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.minted {
+  font-size: 13px;
+  color: #3ddc84;
+  font-family: monospace;
+}
+
+.chain-err {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: #ff8080;
+  line-height: 1.6;
+}
+
+.chain-link {
+  display: inline-block;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #6b9bff;
+  word-break: break-all;
 }
 
 .events {

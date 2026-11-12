@@ -242,6 +242,87 @@ update public.pet_state ps
 2. 目前是单设备模型（`VITE_DEVICE_ID`），多用户需要接 Supabase Auth 把 `device_id` 绑到 `auth.uid()`。
 3. 饥饿度衰减是在读取时按 `hunger_at` 时间差算的，没有后台定时任务，所以**不打开页面也不会"饿死"**（只在读数时结算）。
 
+## 里程碑成就上链（SBT，Sepolia）
+
+`contracts/SmartFitAchievement.sol` —— 运动里程碑成就，Soulbound（一人一枚、不可转让）。
+
+### 合约设计
+
+| 项 | 做法 |
+| --- | --- |
+| 标准 | ERC721 只读子集 + EIP-5192（`locked()` / `Locked` 事件） |
+| 依赖 | **零依赖**，自包含；Remix 直接粘贴即可编译，不需要 npm 解析 |
+| 铸造门槛 | `exp ≥ 300` 或 `steps ≥ 5000`，且**一人一枚**（`balanceOf == 0`） |
+| 数据校验 | 等级必须与经验区间吻合（阈值同 `petRules.ts`），防止客户端乱填 Lv5 + 0 经验 |
+| 元数据 | **完全上链**：`tokenURI` 在链上拼 base64 的 JSON + 内联 SVG，不依赖 IPFS |
+| 编译产物 | 部署字节码 **6958 bytes**（EIP-170 上限 24576） |
+
+编译（改完合约后跑一次，会同时刷新前端 ABI）：
+
+```bash
+cd contracts
+npm install
+npm run compile     # → artifacts/*.json + web/src/features/chain/achievementAbi.ts
+```
+
+### 部署（二选一）
+
+**A. Remix（最快，适合答辩前临时部署）**
+
+1. 打开 <https://remix.ethereum.org>，新建 `SmartFitAchievement.sol`，粘贴源码
+2. Compiler 选 `0.8.24+`，勾上 Enable optimization（runs 200）
+3. Deploy & Run → Environment 选 **Injected Provider - MetaMask**
+4. 网络切到 **Sepolia**（Chain ID `11155111`），点 Deploy
+5. 复制合约地址，填进 `web/.env` 的 `VITE_ACHIEVEMENT_CONTRACT`
+
+Sepolia 测试 ETH 水龙头：<https://sepoliafaucet.com> 或 <https://faucet.quicknode.com/ethereum/sepolia>
+
+**B. Hardhat（要写脚本/测试时用）**
+
+```bash
+cd contracts
+npm i -D hardhat
+npx hardhat init            # 选 "Create a JS project"
+# 把 SmartFitAchievement.sol 放到 contracts/ 下
+npx hardhat compile
+# 在 hardhat.config.js 里配 sepolia 网络 + PRIVATE_KEY（测试网私钥，别用真钱钱包）
+npx hardhat run scripts/deploy.js --network sepolia
+```
+
+> 注意：本项目自带的 `npm run compile` 用 `solc` 直编，不依赖 Hardhat；
+> 只有需要"自动化部署 + 单元测试"时才需要上 Hardhat。
+
+### 前端交互
+
+`web/src/features/chain/`：
+
+| 文件 | 作用 |
+| --- | --- |
+| `achievementAbi.ts` | 编译自动生成，勿手改 |
+| `useAchievementMint.ts` | 连钱包 / 切网络 / mint / 解析回执与自定义错误 |
+
+技术选型：**ethers v6 直连 `window.ethereum`**，不用 wagmi（wagmi 是 React hooks 生态，Vue 要再包一层）。
+
+流程：
+
+```
+连接钱包 (eth_requestAccounts)
+  → 检查 chainId，不是 Sepolia 就 wallet_switchEthereumChain（未添加则 addEthereumChain）
+  → 读 balanceOf 判断是否已领取
+  → mint(exp, steps, level) → 等回执 → 解析 AchievementMinted 事件拿 tokenId
+```
+
+错误都做了人话映射：用户取消（4001）、余额不足、`AlreadyMinted`、`NotEligible`、
+`LevelExpMismatch`（用 `interface.parseError` 解自定义错误）。
+
+### ⚠️ 已知限制（答辩要主动讲）
+
+1. **`exp` / `steps` 是客户端自报的**。合约只校验门槛与等级一致性，没有验证数据来源。
+   生产做法：后端读 `pet_state` 后用 **EIP-712 签名**，合约里 `ecrecover` 校验 + nonce 防重放。
+   合约末尾留了 TODO，这一步正是"链上可信数据"的关键，讲清楚比藏起来好。
+2. 一人一枚（`balanceOf == 0`），适合成就场景；要多个成就要改成 `tokenId` 自增 + 成就类型。
+3. 元数据完全上链，所以**改样式要重新部署**（不可升级）。真要可升级得上代理合约，对毕设过重。
+
 ## 完整演示流程（Demo Flow）
 
 答辩现场按这个顺序，任何一步跳过都会让后面看起来"没数据"。
@@ -288,6 +369,22 @@ App 上「待上传」清零、「已上传」增加、「上次同步」变为�
 
 在笔记本前做 3~5 个深蹲，页面实时显示骨架、膝角、状态与计数。
 如果现场光线或摄像头不给力，**立刻切「上传视频分析」**，用事先录好的视频兜底。
+
+**⑤″ 切到「我的宠物」Tab**（40s，宠物链路演示）
+
+1. 先说数据来源：步数/深蹲由数据库触发器累加进 `pet_state`，**刷新不丢**
+2. 点 **「喂食（消耗 1 食物）」** → 食物 −1、饱食度 +20、宠物换成"比心心"表情
+   - 食物不够时按钮是灰的，并提示"多走走或做几个深蹲吧"（这个失败态也是设计的一部分）
+3. **深蹲联动**：回「深蹲识别」做几个深蹲 → 回到宠物页，`深蹲` 计数与经验会涨
+   （`reps` 表写入 → 触发器 → `pet_state` → Realtime → 页面自动更新，全程不用刷新）
+4. 点调试面板的 **「奖励经验 +100」** 可以立刻看进化动画（震动 → 白光 → 换形态 → 跳跃）
+5. 强调：**刷新页面，等级和经验全都还在**
+
+**⑤‴ 上链铭刻**（可选，需先部署合约）
+
+宠物经验 ≥300 或累计步数 ≥5000 后，"上链铭刻"按钮解锁。
+点它 → MetaMask 确认 → 交易上 Sepolia → 页面显示 tokenId 与 Etherscan 链接。
+细节见下方「里程碑成就上链」。
 
 **⑥ 收尾讲解**
 
