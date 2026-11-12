@@ -1,0 +1,14 @@
+{
+  "name": "smartfit-signer",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SmartFit 里程碑成就 EIP-712 签名服务",
+  "scripts": {
+    "start": "node sign.js",
+    "test:sign": "node test-sign.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0",
+    "pg": "^8.23.1"
+  }
+}

@@ -5,8 +5,29 @@
 
 export const ACHIEVEMENT_ABI = [
   {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "initialSigner",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "constructor"
+  },
+  {
     "inputs": [],
     "name": "AlreadyMinted",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BadNonce",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BadSignature",
     "type": "error"
   },
   {
@@ -22,6 +43,16 @@ export const ACHIEVEMENT_ABI = [
   {
     "inputs": [],
     "name": "NotEligible",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotOwner",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "SignatureExpired",
     "type": "error"
   },
   {
@@ -83,6 +114,38 @@ export const ACHIEVEMENT_ABI = [
     ],
     "name": "Locked",
     "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "previous",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "current",
+        "type": "address"
+      }
+    ],
+    "name": "SignerChanged",
+    "type": "event"
+  },
+  {
+    "inputs": [],
+    "name": "ACHIEVEMENT_TYPEHASH",
+    "outputs": [
+      {
+        "internalType": "bytes32",
+        "name": "",
+        "type": "bytes32"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
   },
   {
     "inputs": [],
@@ -173,7 +236,7 @@ export const ACHIEVEMENT_ABI = [
     "inputs": [
       {
         "internalType": "address",
-        "name": "owner",
+        "name": "who",
         "type": "address"
       }
     ],
@@ -196,6 +259,19 @@ export const ACHIEVEMENT_ABI = [
         "internalType": "string",
         "name": "",
         "type": "string"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "domainSeparator",
+    "outputs": [
+      {
+        "internalType": "bytes32",
+        "name": "",
+        "type": "bytes32"
       }
     ],
     "stateMutability": "view",
@@ -298,6 +374,16 @@ export const ACHIEVEMENT_ABI = [
         "internalType": "uint8",
         "name": "level",
         "type": "uint8"
+      },
+      {
+        "internalType": "uint256",
+        "name": "deadline",
+        "type": "uint256"
+      },
+      {
+        "internalType": "bytes",
+        "name": "signature",
+        "type": "bytes"
       }
     ],
     "name": "mint",
@@ -319,6 +405,38 @@ export const ACHIEVEMENT_ABI = [
         "internalType": "string",
         "name": "",
         "type": "string"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "who",
+        "type": "address"
+      }
+    ],
+    "name": "nonces",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "owner",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
       }
     ],
     "stateMutability": "view",
@@ -415,6 +533,32 @@ export const ACHIEVEMENT_ABI = [
   {
     "inputs": [
       {
+        "internalType": "address",
+        "name": "next",
+        "type": "address"
+      }
+    ],
+    "name": "setSigner",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "signer",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "bytes4",
         "name": "interfaceId",
         "type": "bytes4"
@@ -448,7 +592,7 @@ export const ACHIEVEMENT_ABI = [
     "inputs": [
       {
         "internalType": "address",
-        "name": "owner",
+        "name": "who",
         "type": "address"
       }
     ],

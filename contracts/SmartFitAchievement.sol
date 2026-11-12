@@ -4,15 +4,22 @@ pragma solidity ^0.8.24;
 /**
  * @title SmartFitAchievement — 运动里程碑成就（Soulbound / 不可转让）
  *
- * 设计取舍（答辩会被问到，写在最前面）：
- *  1. **不引 OpenZeppelin**：整个合约自包含，Remix 里直接粘贴即可编译，
- *     不需要 npm 依赖解析。代价是只实现了 ERC721 的只读子集，
- *     不实现 transfer/approve —— SBT 本来就不需要。
- *  2. **一人一枚**：`mint` 里检查 balanceOf == 0，防止刷号。
- *     真正的防作弊应该是服务端 EIP-712 签名，见文末 TODO。
- *  3. **元数据完全上链**：tokenURI 直接在链上拼 base64 的 JSON + SVG，
- *     不依赖 IPFS/中心化服务器，Explorer 和钱包都能直接读到。
- *  4. **等级与经验做一致性校验**：防止客户端随便填 Lv5 + 0 经验。
+ * v2：加入 EIP-712 签名校验 + Nonce 防重放
+ *
+ * 为什么必须有签名（这是 v1 最大的问题）：
+ *   v1 的 exp/steps 是浏览器传进来的，改个数字就能拿"Lv5 成就"。
+ *   v2 要求这些数据由**后端签名**：签名里绑定
+ *       to（领取人）、exp、steps、level、nonce、deadline
+ *   合约用 ecrecover 还原签名者，必须等于部署时指定的 signer。
+ *   于是浏览器只能"转交"签名，不能伪造内容。
+ *
+ * 复用的安全细节：
+ *   1. nonce 每人自增，签名只能用一次（防重放）
+ *   2. deadline 限时，防止旧签名长期有效
+ *   3. 签名里带 to，别人拿到你的签名也用不了（地址不匹配）
+ *   4. s 值范围检查（防签名可锻造性 / malleability）
+ *
+ * 仍然保留"一人一枚"，所以实际上一个地址只能铸造一次。
  */
 contract SmartFitAchievement {
     // ---------------------------------------------------------------- 元数据
@@ -25,6 +32,23 @@ contract SmartFitAchievement {
     /// 上链门槛：经验 >= 300 或累计步数 >= 5000
     uint32 public constant MIN_EXP = 300;
     uint32 public constant MIN_STEPS = 5000;
+
+    // ---------------------------------------------------------------- EIP-712
+
+    bytes32 public constant ACHIEVEMENT_TYPEHASH =
+        keccak256(
+            "Achievement(address to,uint32 exp,uint32 steps,uint8 level,uint256 nonce,uint256 deadline)"
+        );
+
+    bytes32 private constant DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+
+    bytes32 private constant NAME_HASH = keccak256("SmartFitAchievement");
+    bytes32 private constant VERSION_HASH = keccak256("1");
+
+    address public owner;
+    /// 可信签名者（后端签名服务对应的地址）
+    address public signer;
 
     // ---------------------------------------------------------------- 存储
 
@@ -41,6 +65,7 @@ contract SmartFitAchievement {
     mapping(uint256 => address) private _owners;
     mapping(address => uint256) private _tokenOf; // 每人一枚，0 = 未持有
     mapping(uint256 => Achievement) private _achievement;
+    mapping(address => uint256) private _nonces;
 
     // ---------------------------------------------------------------- 事件
 
@@ -55,6 +80,8 @@ contract SmartFitAchievement {
     /// EIP-5192 Minimal Soulbound NFT
     event Locked(uint256 tokenId);
 
+    event SignerChanged(address indexed previous, address indexed current);
+
     // ---------------------------------------------------------------- 错误
 
     error NotEligible();
@@ -63,19 +90,54 @@ contract SmartFitAchievement {
     error LevelExpMismatch();
     error Soulbound();
     error TokenNotExist();
+    error SignatureExpired();
+    error BadNonce();
+    error BadSignature();
+    error NotOwner();
+
+    constructor(address initialSigner) {
+        owner = msg.sender;
+        signer = initialSigner;
+        emit SignerChanged(address(0), initialSigner);
+    }
+
+    // ---------------------------------------------------------------- 管理
+
+    function setSigner(address next) external {
+        if (msg.sender != owner) revert NotOwner();
+        emit SignerChanged(signer, next);
+        signer = next;
+    }
+
+    /// 当前 nonce（签名里要带它，前端读这个值去请求签名）
+    function nonces(address who) external view returns (uint256) {
+        return _nonces[who];
+    }
+
+    function domainSeparator() public view returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(DOMAIN_TYPEHASH, NAME_HASH, VERSION_HASH, block.chainid, address(this))
+            );
+    }
 
     // ---------------------------------------------------------------- 铸造
 
     /**
-     * @notice 领取里程碑成就
-     * @param exp    当前累计经验
-     * @param steps  当前累计步数
-     * @param level  当前等级（1~5）
-     *
-     * 注意：数据由客户端申报。MVP 阶段没有服务端签名校验，
-     * 所以"可信度"依赖于一人一枚 + 门槛校验。升级方案见 TODO。
+     * @notice 领取里程碑成就（需要后端 EIP-712 签名）
+     * @param exp        累计经验（由签名担保）
+     * @param steps      累计步数（由签名担保）
+     * @param level      等级（由签名担保）
+     * @param deadline   签名有效期（unix 秒）
+     * @param signature  后端对上述数据的 EIP-712 签名
      */
-    function mint(uint32 exp, uint32 steps, uint8 level) external returns (uint256 tokenId) {
+    function mint(
+        uint32 exp,
+        uint32 steps,
+        uint8 level,
+        uint256 deadline,
+        bytes calldata signature
+    ) external returns (uint256 tokenId) {
         if (_tokenOf[msg.sender] != 0) revert AlreadyMinted();
         if (level == 0 || level > 5) revert InvalidLevel();
 
@@ -85,6 +147,8 @@ contract SmartFitAchievement {
         // 等级必须与经验区间吻合（阈值与前端 petRules.ts 一致）
         if (exp < minExpForLevel(level)) revert LevelExpMismatch();
         if (level < 5 && exp >= minExpForLevel(uint8(level + 1))) revert LevelExpMismatch();
+
+        _verifySignature(msg.sender, exp, steps, level, deadline, signature);
 
         tokenId = _nextId++;
         _owners[tokenId] = msg.sender;
@@ -103,6 +167,50 @@ contract SmartFitAchievement {
         emit Locked(tokenId);
     }
 
+    function _verifySignature(
+        address to,
+        uint32 exp,
+        uint32 steps,
+        uint8 level,
+        uint256 deadline,
+        bytes calldata signature
+    ) internal {
+        if (block.timestamp > deadline) revert SignatureExpired();
+
+        uint256 nonce = _nonces[to];
+        bytes32 structHash = keccak256(
+            abi.encode(ACHIEVEMENT_TYPEHASH, to, exp, steps, level, nonce, deadline)
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator(), structHash));
+
+        if (_recover(digest, signature) != signer) revert BadSignature();
+
+        // 用掉这个 nonce，同一份签名无法再次使用
+        unchecked {
+            _nonces[to] = nonce + 1;
+        }
+    }
+
+    function _recover(bytes32 digest, bytes calldata sig) internal pure returns (address) {
+        if (sig.length != 65) revert BadSignature();
+
+        bytes32 r = bytes32(sig[0:32]);
+        bytes32 s = bytes32(sig[32:64]);
+        uint8 v = uint8(sig[64]);
+
+        // v 只允许 27/28（不接受 0/1，避免跨链/异构签名歧义）
+        if (v != 27 && v != 28) revert BadSignature();
+        // s 必须 <= secp256k1n/2，否则签名可锻造
+        if (
+            uint256(s) >
+            0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+        ) revert BadSignature();
+
+        address recovered = ecrecover(digest, v, r, s);
+        if (recovered == address(0)) revert BadSignature();
+        return recovered;
+    }
+
     function minExpForLevel(uint8 level) public pure returns (uint32) {
         if (level <= 1) return 0;
         if (level == 2) return 100;
@@ -113,8 +221,8 @@ contract SmartFitAchievement {
 
     // ---------------------------------------------------------------- 只读
 
-    function balanceOf(address owner) external view returns (uint256) {
-        return _tokenOf[owner] == 0 ? 0 : 1;
+    function balanceOf(address who) external view returns (uint256) {
+        return _tokenOf[who] == 0 ? 0 : 1;
     }
 
     function ownerOf(uint256 tokenId) public view returns (address) {
@@ -124,8 +232,8 @@ contract SmartFitAchievement {
     }
 
     /// 地址持有的 tokenId（0 = 没有）
-    function tokenOf(address owner) external view returns (uint256) {
-        return _tokenOf[owner];
+    function tokenOf(address who) external view returns (uint256) {
+        return _tokenOf[who];
     }
 
     function achievementOf(uint256 tokenId) external view returns (Achievement memory) {
@@ -199,7 +307,6 @@ contract SmartFitAchievement {
 
     // ---------------------------------------------------------------- SBT 锁死
 
-    // 任何转移/授权都直接 revert（Soulbound 的核心）
     function transferFrom(address, address, uint256) external pure {
         revert Soulbound();
     }
@@ -234,7 +341,7 @@ contract SmartFitAchievement {
         return
             interfaceId == 0x01ffc9a7 || // ERC165
             interfaceId == 0x80ac58cd || // ERC721（只读子集）
-            interfaceId == 0xb45a3c0e;   // EIP-5192 (locked)
+            interfaceId == 0xb45a3c0e;   // EIP-5192
     }
 
     // ---------------------------------------------------------------- 工具
@@ -294,14 +401,4 @@ contract SmartFitAchievement {
 
         return string(out);
     }
-
-    // ---------------------------------------------------------------- TODO（升级方向）
-    //
-    // 目前 mint 的 exp/steps 是客户端自报，合约只做门槛与等级一致性校验。
-    // 生产环境应该：
-    //   1. 部署者设置一个可信 signer 地址；
-    //   2. 后端（Fastify/Edge Function）读取 pet_state，用 EIP-712 签
-    //      {to, exp, steps, level, nonce, deadline}；
-    //   3. mint 里用 ecrecover 校验签名，并记录 nonce 防重放。
-    // 这样链上数据才有可信来源，答辩时可以主动讲这一点。
 }

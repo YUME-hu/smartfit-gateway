@@ -47,6 +47,7 @@ const {
 // ---------------------------------------------------------------- 上链
 
 const CONTRACT = (env.VITE_ACHIEVEMENT_CONTRACT as string | undefined) ?? ''
+const SIGNER_URL = (env.VITE_SIGNER_URL as string | undefined) || 'http://127.0.0.1:8787'
 const MIN_EXP = 300
 const MIN_STEPS = 5000
 
@@ -64,7 +65,12 @@ const {
   connect,
   switchToSepolia,
   mint,
-} = useAchievementMint({ contractAddress: CONTRACT, minExp: MIN_EXP, minSteps: MIN_STEPS })
+} = useAchievementMint({
+  contractAddress: CONTRACT,
+  signerUrl: SIGNER_URL,
+  minExp: MIN_EXP,
+  minSteps: MIN_STEPS,
+})
 
 /** 达标条件：经验 ≥300 或累计步数 ≥5000（合约里也校验一遍，这里是 UX） */
 const eligible = computed(() => exp.value >= MIN_EXP || stepsTotal.value >= MIN_STEPS)
@@ -75,13 +81,8 @@ function short(v: string | null | undefined): string {
 }
 
 async function onMint(): Promise<void> {
-  await mint(totalExpForMint(), stepsTotal.value, progress.value.level)
-  if (!mintError.value) log('已提交上链交易')
-}
-
-/** mint 用的经验值（避免和模板里的表达式重复计算） */
-function totalExpForMint(): number {
-  return summary.value?.exp ?? 0
+  await mint()
+  if (!mintError.value) log('已提交上链交易（数据由签名服务担保）')
 }
 
 // ---------------------------------------------------------------- 本地 UI 状态

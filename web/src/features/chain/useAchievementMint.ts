@@ -40,8 +40,20 @@ function injected(): Eip1193 | null {
 
 export interface UseMintOptions {
   contractAddress: string
+  /** 签名服务地址，例如 http://127.0.0.1:8787 */
+  signerUrl: string
   minExp: number
   minSteps: number
+}
+
+export interface SignedAchievement {
+  signature: string
+  exp: number
+  steps: number
+  level: number
+  nonce: string
+  deadline: number
+  signer: string
 }
 
 export type MintPhase = 'idle' | 'connecting' | 'switching' | 'signing' | 'pending' | 'done' | 'error'
@@ -146,8 +158,8 @@ export function useAchievementMint(opts: UseMintOptions) {
     }
   }
 
-  /** 铸造：exp / steps / level 来自当前宠物状态 */
-  async function mint(exp: number, steps: number, level: number): Promise<void> {
+  /** 铸造：先拿后端签名，再把签名交给合约 */
+  async function mint(): Promise<void> {
     const eth = injected()
     if (!eth || !account.value) {
       error.value = '请先连接钱包'
@@ -162,12 +174,53 @@ export function useAchievementMint(opts: UseMintOptions) {
     error.value = null
     txHash.value = null
     phase.value = 'signing'
+
     try {
+      const readonly = readContract()
+      if (!readonly) {
+        error.value = '合约地址未配置'
+        phase.value = 'error'
+        return
+      }
+
+      // 1) 读链上 nonce（防重放：签名里绑这个值，用完即失效）
+      const nonce: bigint = await readonly.nonces(account.value)
+
+      // 2) 向后端要签名。注意：请求体只有地址和 nonce，
+      //    经验/步数/等级由服务端从数据库读，浏览器改不了
+      const resp = await fetch(`${opts.signerUrl.replace(/\/+$/, '')}/sign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: account.value, nonce: nonce.toString() }),
+      })
+
+      if (!resp.ok) {
+        let msg = `签名服务返回 ${resp.status}`
+        try {
+          const e = await resp.json()
+          msg = e.message ?? msg
+        } catch {
+          // 保持默认文案
+        }
+        error.value = msg + '（确认签名服务已启动，且数据已达标）'
+        phase.value = 'error'
+        return
+      }
+
+      const signed = (await resp.json()) as SignedAchievement
+
+      // 3) 带上签名调用合约
       const provider = new BrowserProvider(eth as never)
       const signer = await provider.getSigner()
       const c = new Contract(opts.contractAddress, ACHIEVEMENT_ABI, signer)
 
-      const tx = await c.mint(exp, steps, level)
+      const tx = await c.mint(
+        signed.exp,
+        signed.steps,
+        signed.level,
+        signed.deadline,
+        signed.signature,
+      )
       txHash.value = tx.hash
       phase.value = 'pending'
 
@@ -187,6 +240,16 @@ export function useAchievementMint(opts: UseMintOptions) {
     } catch (e) {
       phase.value = 'error'
       error.value = decodeRevert(e)
+    }
+  }
+
+  /** 体检：签名服务是否在线（点连接钱包时顺手探一下） */
+  async function checkSigner(): Promise<boolean> {
+    try {
+      const r = await fetch(`${opts.signerUrl.replace(/\/+$/, '')}/health`)
+      return r.ok
+    } catch {
+      return false
     }
   }
 
@@ -243,6 +306,7 @@ export function useAchievementMint(opts: UseMintOptions) {
     connect,
     switchToSepolia,
     mint,
+    checkSigner,
     refreshMinted,
   }
 }

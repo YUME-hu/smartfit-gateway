@@ -246,24 +246,80 @@ update public.pet_state ps
 
 `contracts/SmartFitAchievement.sol` —— 运动里程碑成就，Soulbound（一人一枚、不可转让）。
 
+**v2：数据由后端 EIP-712 签名担保，浏览器改不了。**
+
+### 为什么必须有签名（v1 的问题）
+
+v1 的 `exp / steps` 是浏览器传进合约的，改个数字就能拿"Lv5 成就"。
+v2 要求这些数据由**后端签名**，签名里绑定 `to / exp / steps / level / nonce / deadline`：
+
+```
+浏览器 ──(地址, nonce)──▶ 签名服务 ──(读 pet_state)──▶ 数据库
+                              │
+                              └── EIP-712 签名 ──▶ 浏览器 ──(mint + 签名)──▶ 合约
+                                                                    │
+                                                        ecrecover == signer ?
+```
+
+浏览器只能"转交"签名，不能伪造内容 —— 改任何一个字段，`ecrecover` 出来的地址就变了。
+
 ### 合约设计
 
 | 项 | 做法 |
 | --- | --- |
 | 标准 | ERC721 只读子集 + EIP-5192（`locked()` / `Locked` 事件） |
-| 依赖 | **零依赖**，自包含；Remix 直接粘贴即可编译，不需要 npm 解析 |
-| 铸造门槛 | `exp ≥ 300` 或 `steps ≥ 5000`，且**一人一枚**（`balanceOf == 0`） |
-| 数据校验 | 等级必须与经验区间吻合（阈值同 `petRules.ts`），防止客户端乱填 Lv5 + 0 经验 |
-| 元数据 | **完全上链**：`tokenURI` 在链上拼 base64 的 JSON + 内联 SVG，不依赖 IPFS |
-| 编译产物 | 部署字节码 **6958 bytes**（EIP-170 上限 24576） |
+| 依赖 | **零依赖**，自包含；Remix 直接粘贴即可编译 |
+| 验签 | `ecrecover` + EIP-712 domain（name/version/chainId/verifyingContract） |
+| 防重放 | 每人自增 `nonce`（签名里绑定，用完即失效） |
+| 防过期 | `deadline`（签名服务默认给 10 分钟） |
+| 防锻造 | `s <= secp256k1n/2`、`v ∈ {27,28}` 检查 |
+| 铸造门槛 | `exp ≥ 300` 或 `steps ≥ 5000`，一人一枚 |
+| 数据校验 | 等级必须与经验区间吻合（阈值同 `petRules.ts`） |
+| 元数据 | 完全上链：`tokenURI` 拼 base64 JSON + 内联 SVG |
+| 编译产物 | **8424 bytes**（EIP-170 上限 24576） |
 
 编译（改完合约后跑一次，会同时刷新前端 ABI）：
 
 ```bash
-cd contracts
-npm install
-npm run compile     # → artifacts/*.json + web/src/features/chain/achievementAbi.ts
+cd contracts && npm install && npm run compile
 ```
+
+### 签名服务（`server/`）
+
+零框架，只用 `node:http` + `ethers` + `pg`，100 多行。
+
+```bash
+cd server
+npm install
+cp .env.example .env        # 填 SIGNER_PRIVATE_KEY / SUPABASE_DB_URL / CONTRACT_ADDRESS
+npm start                   # http://127.0.0.1:8787
+```
+
+接口：
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/health` | 返回签名者地址、合约、门槛，前端可用来探活 |
+| POST | `/sign` | body `{ to, nonce }` → 返回签名 + 服务端计算出的 exp/steps/level |
+
+**关键点：请求体里没有 exp/steps**。服务端自己去 `pet_state` 查，所以浏览器没有篡改面。
+
+生成一个测试网专用私钥：
+
+```bash
+node -e "console.log(require('ethers').Wallet.createRandom().privateKey)"
+```
+
+把这个私钥对应的**地址**填进 Remix 部署时的构造参数 `initialSigner`。
+
+集成测试（会自动起服务、签名、用 `verifyTypedData` 反解、并验证篡改后还原出不同地址）：
+
+```bash
+cd server
+SUPABASE_DB_URL=postgresql://... npm run test:sign
+```
+
+![](https://img.shields.io/badge/-无需浏览器-important) 这个测试不需要钱包、不需要链，纯粹验证 EIP-712 实现自洽。
 
 ### 部署（二选一）
 
@@ -272,8 +328,10 @@ npm run compile     # → artifacts/*.json + web/src/features/chain/achievementA
 1. 打开 <https://remix.ethereum.org>，新建 `SmartFitAchievement.sol`，粘贴源码
 2. Compiler 选 `0.8.24+`，勾上 Enable optimization（runs 200）
 3. Deploy & Run → Environment 选 **Injected Provider - MetaMask**
-4. 网络切到 **Sepolia**（Chain ID `11155111`），点 Deploy
-5. 复制合约地址，填进 `web/.env` 的 `VITE_ACHIEVEMENT_CONTRACT`
+4. 网络切到 **Sepolia**（Chain ID `11155111`）
+5. Deploy 时构造参数 `initialSigner` 填**签名服务的地址**（`npm start` 启动日志里那行 `signer address`）
+6. 复制合约地址，填进 `web/.env` 的 `VITE_ACHIEVEMENT_CONTRACT`，并同步到 `server/.env` 的 `CONTRACT_ADDRESS`
+7. 重启签名服务（它启动时会把合约地址打进日志，方便核对）
 
 Sepolia 测试 ETH 水龙头：<https://sepoliafaucet.com> 或 <https://faucet.quicknode.com/ethereum/sepolia>
 
@@ -317,11 +375,14 @@ npx hardhat run scripts/deploy.js --network sepolia
 
 ### ⚠️ 已知限制（答辩要主动讲）
 
-1. **`exp` / `steps` 是客户端自报的**。合约只校验门槛与等级一致性，没有验证数据来源。
-   生产做法：后端读 `pet_state` 后用 **EIP-712 签名**，合约里 `ecrecover` 校验 + nonce 防重放。
-   合约末尾留了 TODO，这一步正是"链上可信数据"的关键，讲清楚比藏起来好。
-2. 一人一枚（`balanceOf == 0`），适合成就场景；要多个成就要改成 `tokenId` 自增 + 成就类型。
-3. 元数据完全上链，所以**改样式要重新部署**（不可升级）。真要可升级得上代理合约，对毕设过重。
+1. **签名服务本身没有鉴权**。谁都能请求签名（只要数据达标），所以部署到公网前必须加
+   鉴权（例如要求 Supabase 登录态）+ 限流。目前只监听 `127.0.0.1`，是本地演示形态。
+2. **私钥在环境变量里**。测试网够用；生产应该用 KMS / 硬件钱包，且 signer 地址可轮换
+   （合约里有 `setSigner`，仅 owner 可调）。
+3. **nonce 由前端提供**（签名里绑定、链上校验）。这本身安全 —— 前端只能选 nonce，
+   改不了 exp/steps —— 但如果想彻底消除前端参与，可以让签名服务直接读链上 nonce。
+4. 一人一枚（`balanceOf == 0`），适合成就场景；要多个成就需改成按类型分发 tokenId。
+5. 元数据完全上链，所以**改样式要重新部署**（不可升级）。
 
 ## 完整演示流程（Demo Flow）
 
