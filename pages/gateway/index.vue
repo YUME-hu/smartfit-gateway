@@ -95,8 +95,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import MiniChart from '../../components/MiniChart.vue'
-import { gatewayConfig, missingEnv } from '../../config'
-import { useImuGateway } from '../../gateway/useImuGateway'
+import { gatewayConfig, missingEnv } from '../../src/config'
+import { useImuGateway } from '../../src/gateway/useImuGateway'
 
 const missing = missingEnv
 

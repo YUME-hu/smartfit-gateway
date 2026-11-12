@@ -1,0 +1,18 @@
+{
+  "pages": [
+    {
+      "path": "pages/gateway/index",
+      "style": {
+        "navigationStyle": "custom",
+        "navigationBarTitleText": "SmartFit 网关",
+        "backgroundColor": "#0f1115"
+      }
+    }
+  ],
+  "globalStyle": {
+    "navigationBarTextStyle": "white",
+    "navigationBarTitleText": "SmartFit",
+    "navigationBarBackgroundColor": "#0f1115",
+    "backgroundColor": "#0f1115"
+  }
+}

@@ -9,8 +9,9 @@
     "build:test": "tsc -p tsconfig.build.json",
     "check:sfc": "node scripts/check-sfc.cjs",
     "check:workflow": "node scripts/check-workflow.cjs",
+    "check:uniapp": "node scripts/check-uniapp.cjs",
     "test": "npm run build:test && node --test tests/gateway.test.cjs",
-    "verify": "npm run typecheck && npm run check:sfc && npm run check:workflow && npm test",
+    "verify": "npm run typecheck && npm run check:sfc && npm run check:workflow && npm run check:uniapp && npm test",
     "verify:db": "node scripts/verify-db.cjs",
     "verify:rt": "node scripts/verify-realtime.cjs"
   },

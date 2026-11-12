@@ -13,5 +13,7 @@
     "noUnusedParameters": true,
     "types": []
   },
-  "include": ["src/**/*.ts", "web/**/*.ts", "types/**/*.d.ts"]
+  // web/ 是独立的 Vite 工程（有自己的 tsconfig 与依赖），
+  // 这里不纳入，否则根工程的 tsc 会去解析 vite 类型而报错
+  "include": ["src/**/*.ts", "types/**/*.d.ts"]
 }
