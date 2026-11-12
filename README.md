@@ -39,9 +39,10 @@ App 网关
 | ① 手表 5 秒一包 + 窗口计步 | `firmware/watch_ble/` + `firmware/common/step_counter.h` | ✅ 实测 5.01s / 5 字段 / 静置 0 步；算法合成信号自测 PASS |
 | ② 手机本地缓存 | `src/gateway/cache.ts` | ✅ 单测 |
 | ③ 每 15 分钟批量 insert | `src/gateway/syncEngine.ts` | ✅ 单测 |
-| ④ 实时看板 | `src/gateway/latest.ts` + `web/useDeviceLatest.ts` | ⚠️ 未真机 |
+| ④ 实时看板 | `src/gateway/latest.ts` + `web/useDeviceLatest.ts` | ✅ 云端实测收到 UPDATE 事件，⚠️ 未真机 |
 | ⑤ 立即同步按钮 | `pages/gateway/index.vue` | ✅ SFC 编译，⚠️ 未真机 |
 | ⑥ 波形/步数图表 | `components/MiniChart.vue` | ✅ SFC 编译，⚠️ 未真机 |
+| ⑦ 云端 schema | `supabase/migrations/`（3 个迁移） | ✅ `db push` 已应用 + 10 项校验全过 |
 
 ## 工程化三件事
 
@@ -119,6 +120,10 @@ supabase db push           # 应用 supabase/migrations/*.sql
   缓存块切换与容量上限、seq 回退判定、同步失败不丢数据、并发单飞、批次上限
 - 两个 `.vue` 用 `@vue/compiler-sfc` 编译通过（`scripts/check-sfc.cjs`）
 - workflow YAML 解析通过
+- **云端 schema 已实测**：3 个迁移 `db push` 成功；`scripts/verify-db.cjs`
+  10 项全 PASS（表/列/RLS/策略/publication/RPC/幂等/混合批次）
+- **Realtime 已实测**：`scripts/verify-realtime.cjs` 收到 UPDATE 事件
+- **写入路径已实测**：anon 调 RPC 首次返回 1、重试返回 0；直连写表被 RLS 挡下
 
 没做（没有 HBuilderX / 手机 / Android SDK，不能声称已验证）：
 
@@ -189,7 +194,72 @@ BLE 负载：`x,y,z,seq,steps`
 
 幂等键 `client_key = {deviceId}:{bootEpoch}:{seq}`，如 `watch-01:1:42`。
 `bootEpoch` 由网关通过 "seq 回退 ⇒ 手表重启" 推断并持久化。
-Supabase 对 `client_key` 有唯一约束 + upsert，重试不会写重复行。
+
+写入不走 PostgREST 的 upsert，而是走 `ingest_samples(p_rows jsonb)` 这个
+`SECURITY DEFINER` 函数（`INSERT ... ON CONFLICT DO NOTHING`）。原因见下节。
+
+## 云端链路实测记录（两个必踩的坑）
+
+这一段是接真 Supabase 项目时实测出来的，不是纸面设计。都已在迁移里修掉。
+
+### 坑 1：带 `Prefer: resolution=...` 的写入会被 RLS 拒绝
+
+隔离实验（同一个 anon key、同一张表）：
+
+| 请求 | 结果 |
+| --- | --- |
+| 纯 INSERT，无参数无 header | **201** ✅ |
+| 只带 `?on_conflict=client_key` | **201** ✅ |
+| 只带 `Prefer: resolution=ignore-duplicates` | **401 / 42501** ❌ |
+| 两者都带（原实现） | **401 / 42501** ❌ |
+
+PostgREST 把 `resolution` 翻译成 `ON CONFLICT DO UPDATE`，而 DO UPDATE 分支
+要求调用者有 UPDATE 策略 —— 即使没有任何冲突也会检查。给 anon 开 UPDATE 等于
+允许篡改历史样本，不能接受。
+
+退化成纯 INSERT 虽然能写，但**一行重复会让整批回滚**：App 重装后本地
+`bootEpoch` 从 0 重来，seq 与历史撞键，这一批的新样本会一起被拒 —— 静默丢数据。
+
+**修法**：写入改走 `ingest_samples(jsonb)` RPC（`SECURITY DEFINER` +
+`ON CONFLICT DO NOTHING`）。重复行跳过、新行照写，anon 只需 EXECUTE。
+实测：首次调用返回 `1`，同批重试返回 `0`，混合批次只写新行。
+
+### 坑 2：Realtime 收不到 UPDATE 事件
+
+`device_latest` 每个包都会被 UPDATE 一次，但默认 `REPLICA IDENTITY`（仅主键）
+下，带 RLS 的订阅**收不到 UPDATE 事件，而且不报错**：
+
+- 插入全新行 → 收到 ✅
+- UPDATE 已有行 → 10 秒收不到 ❌
+
+表现就是 Web 看板只显示第一帧、之后永远不刷新。
+
+**修法**：`alter table public.device_latest replica identity full;`
+（迁移 `20261112130000`）。修完复测，UPDATE 事件正常到达。
+代价是 UPDATE 的 WAL 记录变大，单行小表可忽略。
+
+### 本机网络注意：直连是纯 IPv6
+
+`db.<ref>.supabase.co` 只有 AAAA 记录，本机没有全局 IPv6，所以直连 5432 不通。
+必须走 IPv4 的连接池：
+
+```bash
+supabase db push --remote="postgresql://postgres.<ref>:<密码>@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres" --yes
+```
+
+- `aws-1-<region>` 而不是 `aws-0-`（用错误密码探测可区分：`aws-0` 报
+  `tenant/user not found`，`aws-1` 报 `password authentication failed`，后者才对）
+- 非交互环境必须加 `--yes`，否则提示 `Confirmation required`
+- `--remote=<url>` 模式**不需要** `supabase login`
+
+### 凭据走环境变量
+
+验证脚本从环境变量读连接串，不写死、不入库：
+
+```powershell
+$env:SUPABASE_DB_URL="postgresql://..."; node scripts/verify-db.cjs
+$env:SUPABASE_URL="https://<ref>.supabase.co"; $env:SUPABASE_KEY="sb_publishable_..."; node scripts/verify-realtime.cjs
+```
 
 ## 命令
 
@@ -198,4 +268,8 @@ npm run typecheck   # 类型检查
 npm run check:sfc   # .vue 编译检查
 npm test            # 编译 + 20 个单元测试
 npm run verify      # 上面三个一起跑
+
+# 连云端验证（需要环境变量，见上）
+npm run verify:db   # schema / RLS / RPC / publication
+npm run verify:rt   # Realtime 是否真的推事件
 ```

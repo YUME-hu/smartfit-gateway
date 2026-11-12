@@ -58,6 +58,8 @@ export interface GatewayConfig {
   supabaseAnonKey: string
   /** 样本表名 */
   sampleTable: string
+  /** 批量写入用的 Postgres 函数（SECURITY DEFINER，逐行 ON CONFLICT DO NOTHING） */
+  sampleRpc: string
   /** 最新值表名（供 Web 端 Realtime 订阅） */
   latestTable: string
 
@@ -75,6 +77,7 @@ export const DEFAULT_CONFIG: Omit<GatewayConfig, 'supabaseUrl' | 'supabaseAnonKe
   charUuid: '0000FFF1-0000-1000-8000-00805F9B34FB',
   deviceId: 'watch-01',
   sampleTable: 'imu_samples',
+  sampleRpc: 'ingest_samples',
   latestTable: 'device_latest',
   syncIntervalMs: 15 * 60 * 1000,
   batchSize: 500,

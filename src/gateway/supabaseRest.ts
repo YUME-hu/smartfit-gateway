@@ -40,6 +40,8 @@ export interface SupabaseOptions {
   anonKey: string
   sampleTable: string
   latestTable: string
+  /** 批量写入函数名，默认 ingest_samples */
+  sampleRpc: string
   timeoutMs?: number
 }
 
@@ -74,22 +76,27 @@ export class SupabaseRest {
     }
   }
 
-  /** 批量 upsert 样本 */
+  /**
+   * 批量写入样本
+   *
+   * **不用** PostgREST 的 `Prefer: resolution=...`：实测它会被翻译成
+   * `ON CONFLICT DO UPDATE`，而 DO UPDATE 要求调用者有 UPDATE 策略；
+   * 给 anon 开 UPDATE 等于允许篡改历史样本，不可接受。
+   * 退化成纯 INSERT 又会让"一行重复 → 整批回滚"，App 重装后撞键就静默丢数据。
+   *
+   * 所以走 SECURITY DEFINER 的 RPC：逐行 ON CONFLICT DO NOTHING，
+   * 重复跳过、新行照写，且 anon 只需 EXECUTE 权限。
+   */
   async insertSamples(samples: ImuSample[]): Promise<void> {
     if (samples.length === 0) return
 
     const rows = samples.map((s) => this.toRow(s))
-    const path =
-      `/rest/v1/${this.opts.sampleTable}` +
-      `?on_conflict=client_key`
+    const res = await this.post(
+      `/rest/v1/rpc/${this.opts.sampleRpc}`,
+      { p_rows: rows },
+      ['return=minimal'],
+    )
 
-    const res = await this.post(path, rows, [
-      'resolution=merge-duplicates',
-      'return=minimal',
-    ])
-
-    // 409/23505：唯一约束冲突，说明这批已经写过了 —— 视为成功
-    if (res.status === 409) return
     if (res.status < 200 || res.status >= 300) {
       throw new SupabaseError(res.status, this.describe(res))
     }

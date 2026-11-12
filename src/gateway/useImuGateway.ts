@@ -62,6 +62,7 @@ export function useImuGateway(config: GatewayConfig) {
     url: config.supabaseUrl,
     anonKey: config.supabaseAnonKey,
     sampleTable: config.sampleTable,
+    sampleRpc: config.sampleRpc,
     latestTable: config.latestTable,
   })
 

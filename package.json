@@ -8,16 +8,18 @@
     "typecheck": "tsc --noEmit",
     "build:test": "tsc -p tsconfig.build.json",
     "check:sfc": "node scripts/check-sfc.cjs",
-    "verify": "npm run typecheck && npm run check:sfc && npm test",
-    "test": "npm run build:test && node --test tests/gateway.test.cjs"
+    "check:workflow": "node scripts/check-workflow.cjs",
+    "test": "npm run build:test && node --test tests/gateway.test.cjs",
+    "verify": "npm run typecheck && npm run check:sfc && npm run check:workflow && npm test",
+    "verify:db": "node scripts/verify-db.cjs",
+    "verify:rt": "node scripts/verify-realtime.cjs"
   },
   "devDependencies": {
     "@supabase/supabase-js": "^2.45.0",
+    "js-yaml": "^5.5.0",
+    "pg": "^8.23.1",
     "supabase": "^3.1.0",
     "typescript": "^5.6.0",
     "vue": "^3.5.0"
-  },
-  "dependencies": {
-    "js-yaml": "^5.5.0"
   }
 }
