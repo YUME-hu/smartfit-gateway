@@ -54,6 +54,12 @@ function fail(msg) {
 if (!SIGNER_PRIVATE_KEY) fail('缺少 SIGNER_PRIVATE_KEY')
 if (!SUPABASE_DB_URL) fail('缺少 SUPABASE_DB_URL')
 if (!/^0x[0-9a-fA-F]{40}$/.test(CONTRACT_ADDRESS)) fail('CONTRACT_ADDRESS 不是合法地址')
+if (/^0x0{40}$/i.test(CONTRACT_ADDRESS)) {
+  fail(
+    'CONTRACT_ADDRESS 还是占位符。请先用 Remix 部署合约，把地址填进 server/.env 再启动。\n' +
+      '        （没有真实合约地址时签名会绑定错误的 verifyingContract，链上必然验不过）',
+  )
+}
 
 const wallet = new ethers.Wallet(SIGNER_PRIVATE_KEY)
 const signerAddress = wallet.address
