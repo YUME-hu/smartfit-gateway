@@ -351,14 +351,19 @@ onBeforeUnmount(() => {
     </section>
 
     <details class="debug">
-      <summary>调试面板（演示与测试用）</summary>
+      <summary>
+        <span class="dev-tag">⚙ 调试</span>
+        调试面板（仅供演示，非正式功能）
+      </summary>
       <div class="debug-body">
-        <button @click="onAddExp">奖励经验 +100</button>
-        <button @click="simulateSquats">模拟 10 个深蹲</button>
-        <button @click="forceEvolution()">播一次进化动画</button>
+        <button @click="onAddExp"><span class="dev-tag">调试</span>奖励经验 +100</button>
+        <button @click="simulateSquats"><span class="dev-tag">调试</span>模拟 10 个深蹲</button>
+        <button @click="forceEvolution()"><span class="dev-tag">调试</span>播一次进化动画</button>
         <p class="debug-note">
-          经验来自 <code>pet_state</code>（<code>exp</code> 是生成列，由累计步数/深蹲算出），
-          刷新不会丢。深蹲按钮会**真实写入 <code>reps</code> 表**并触发宠物累加。
+          这些按钮只为演示"升级 / 进化"效果，正式版本会整个移除：
+          <br />· <strong>奖励经验</strong>只写 <code>bonus_exp</code>，
+          <strong>不修改步数与深蹲记录</strong>（所以成就里的运动数据仍然是真实的）
+          <br />· <strong>模拟深蹲</strong>会真实写入 <code>reps</code> 表（等价于你在深蹲页做 10 个）
         </p>
       </div>
     </details>
@@ -723,6 +728,21 @@ onBeforeUnmount(() => {
 .debug summary {
   cursor: pointer;
   color: #6b7387;
+}
+
+/* 调试标记：防止答辩时被误认为"作弊功能" */
+.dev-tag {
+  display: inline-block;
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 6px;
+  margin-right: 6px;
+  border-radius: 4px;
+  background: rgba(255, 176, 32, 0.16);
+  border: 1px solid rgba(255, 176, 32, 0.5);
+  color: #ffb020;
+  font-family: monospace;
+  vertical-align: middle;
 }
 
 .debug-body {
