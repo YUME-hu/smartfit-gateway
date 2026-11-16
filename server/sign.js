@@ -24,6 +24,8 @@
  */
 
 const http = require('node:http')
+const fs = require('node:fs')
+const path = require('node:path')
 const { ethers } = require('ethers')
 const { Pool } = require('pg')
 
@@ -34,7 +36,7 @@ const HOST = process.env.HOST || '127.0.0.1'
 
 const SIGNER_PRIVATE_KEY = process.env.SIGNER_PRIVATE_KEY || ''
 const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL || ''
-/** 数据库 TLS 的 CA（PEM）。留空 = 用系统 CA 校验；换行可写成字面量 \n */
+/** 数据库 TLS 的 CA：PEM 字符串（-----BEGIN 开头）或文件路径（相对 server/）。留空 = 系统 CA */
 const SUPABASE_CA_CERT = process.env.SUPABASE_CA_CERT || ''
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || ''
 const CHAIN_ID = Number(process.env.CHAIN_ID || 11155111) // Sepolia
@@ -68,6 +70,31 @@ const wallet = new ethers.Wallet(SIGNER_PRIVATE_KEY)
 const signerAddress = wallet.address
 
 /**
+ * 读取 CA：SUPABASE_CA_CERT 以 -----BEGIN 开头就当 PEM 字符串，否则当文件路径。
+ *
+ * 路径相对 server/ 解析（__dirname），所以 `SUPABASE_CA_CERT=./certs/supabase-root.pem`
+ * 不管从哪个目录启动都指向同一份文件 —— 团队/CI 统一用路径，本地临时贴字符串也行。
+ */
+function readCaCert(value) {
+  const v = (value || '').trim()
+  if (!v) return ''
+  if (v.startsWith('-----BEGIN')) return v.replace(/\\n/g, '\n')
+
+  const file = path.resolve(__dirname, v)
+  if (!fs.existsSync(file)) {
+    fail(
+      `SUPABASE_CA_CERT 指向的文件不存在: ${file}\n` +
+        '        也可以直接把 PEM 内容贴进这个变量（以 -----BEGIN 开头）',
+    )
+  }
+  const pem = fs.readFileSync(file, 'utf8')
+  if (!pem.includes('-----BEGIN CERTIFICATE-----')) {
+    fail(`SUPABASE_CA_CERT 指向的文件里没有 PEM 证书: ${file}`)
+  }
+  return pem
+}
+
+/**
  * 数据库 TLS 配置
  *
  * 这里没有"关掉校验"的开关：证书校验恒为开，唯一的变量是拿什么当信任锚。
@@ -80,12 +107,13 @@ const signerAddress = wallet.address
  * assertDsnSslMode() 把这类写法拦下来。
  *
  * 不替用户"兜底"：CA 不对就握手失败（连不上就是连不上），不会降级成不校验。
- * PEM 里的换行可以写成字面量 \n（写 .env 单行更省事）。
  */
 function buildPgSsl(caPem) {
-  if (!caPem.trim()) return { rejectUnauthorized: true }
-  return { ca: caPem.replace(/\\n/g, '\n'), rejectUnauthorized: true }
+  if (!caPem) return { rejectUnauthorized: true }
+  return { ca: caPem, rejectUnauthorized: true }
 }
+
+const SUPABASE_CA_PEM = readCaCert(SUPABASE_CA_CERT)
 
 /**
  * 拦住"会关掉 TLS / 证书校验"的 sslmode
@@ -138,7 +166,7 @@ assertDsnSslMode(SUPABASE_DB_URL)
 
 const pool = new Pool({
   connectionString: SUPABASE_DB_URL,
-  ssl: buildPgSsl(SUPABASE_CA_CERT),
+  ssl: buildPgSsl(SUPABASE_CA_PEM),
   max: 4,
 })
 
