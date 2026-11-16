@@ -1,0 +1,97 @@
+# =============================================================================
+# verify.yml —— 真实可跑的门禁
+#
+# 这里只验证仓库现在**真的具备**的东西：
+#   · 网关侧：TS 类型 → .vue 编译 → workflow YAML → uni-app 工程静态检查 → 单元测试
+#   · 看板侧：vue-tsc 类型 → 单元测试 → vite 生产构建
+#
+# 不依赖任何 secrets，不连线上 Supabase：单测跑的是 tsc 编译出来的本地产物，
+# 构建用的是仓库里自带的模型文件与 npm 依赖，全程离线可复现。
+#
+# 与 build-apk.yml 的分工：APK 打包假设的是 uni-app CLI 工程形态，当前仓库不是，
+# 那个工作流已改为只手动触发（见其文件头说明）。日常门禁就是本文件。
+# =============================================================================
+name: Verify
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# 只看代码，不需要写任何东西
+permissions:
+  contents: read
+
+# 同一分支连续 push 时，取消上一轮还在跑的任务
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 网关（根目录）：类型 + 三个静态检查 + 单测
+  # ---------------------------------------------------------------------------
+  gateway:
+    name: 网关（类型 + 静态检查 + 单测）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      # `npm run verify` 就是下面五步的串联（typecheck → check:sfc →
+      # check:workflow → check:uniapp → npm test）。这里拆成独立 step，
+      # 是为了在 Actions 界面上一眼看出挂在哪一关、各步耗时多少；
+      # 命令集合与 `npm run verify` 完全一致，没有删减。
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: .vue 编译检查
+        run: npm run check:sfc
+
+      - name: workflow YAML 检查
+        run: npm run check:workflow
+
+      - name: uni-app 工程静态检查
+        run: npm run check:uniapp
+
+      - name: 单元测试
+        run: npm test
+
+  # ---------------------------------------------------------------------------
+  # 看板（web/）：类型 + 单测 + 生产构建
+  # ---------------------------------------------------------------------------
+  web:
+    name: 看板（类型 + 单测 + 构建）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          # defaults.run.working-directory 不影响这个路径，它相对仓库根
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      # vue-tsc --noEmit && npm test（测试跑 tsc 产物，见 web/tsconfig.test.json）
+      - name: 类型检查 + 单元测试
+        run: npm run verify
+
+      # prepare:assets（把 mediapipe wasm 从依赖复制到 public/）+ vite build
+      - name: 生产构建
+        run: npm run build

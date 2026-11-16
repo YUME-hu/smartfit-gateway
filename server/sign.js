@@ -20,6 +20,7 @@
  *   1. 这个私钥只能是**测试网专用**，绝不能是真钱钱包
  *   2. 默认只监听 127.0.0.1；部署到公网必须加鉴权 + HTTPS
  *   3. 服务不落盘、不记日志里的敏感信息
+ *   4. 数据库连接**校验证书**：默认用系统 CA；自签实例通过 SUPABASE_CA_CERT 指定 CA
  */
 
 const http = require('node:http')
@@ -33,6 +34,8 @@ const HOST = process.env.HOST || '127.0.0.1'
 
 const SIGNER_PRIVATE_KEY = process.env.SIGNER_PRIVATE_KEY || ''
 const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL || ''
+/** 数据库 TLS 的 CA（PEM）。留空 = 用系统 CA 校验；换行可写成字面量 \n */
+const SUPABASE_CA_CERT = process.env.SUPABASE_CA_CERT || ''
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || ''
 const CHAIN_ID = Number(process.env.CHAIN_ID || 11155111) // Sepolia
 const DEVICE_ID = process.env.DEVICE_ID || 'watch-01'
@@ -64,9 +67,78 @@ if (/^0x0{40}$/i.test(CONTRACT_ADDRESS)) {
 const wallet = new ethers.Wallet(SIGNER_PRIVATE_KEY)
 const signerAddress = wallet.address
 
+/**
+ * 数据库 TLS 配置
+ *
+ * 这里没有"关掉校验"的开关：证书校验恒为开，唯一的变量是拿什么当信任锚。
+ *   · 配了 SUPABASE_CA_CERT → 用它校验服务端证书（自签 / 私有 CA 的实例）
+ *   · 没配 → 不传 ca，交给 Node 的系统 CA 库（公开 CA 签发的实例）
+ *
+ * pg 的坑（用仓库里这份 pg 实测过）：ConnectionParameters 会把连接串解析结果
+ * Object.assign 到显式配置之上（pg/lib/connection-parameters.js:60），所以
+ * sslmode=no-verify / disable 能盖掉下面这个 ssl 对象 —— 启动时先由
+ * assertDsnSslMode() 把这类写法拦下来。
+ *
+ * 不替用户"兜底"：CA 不对就握手失败（连不上就是连不上），不会降级成不校验。
+ * PEM 里的换行可以写成字面量 \n（写 .env 单行更省事）。
+ */
+function buildPgSsl(caPem) {
+  if (!caPem.trim()) return { rejectUnauthorized: true }
+  return { ca: caPem.replace(/\\n/g, '\n'), rejectUnauthorized: true }
+}
+
+/**
+ * 拦住"会关掉 TLS / 证书校验"的 sslmode
+ *
+ * 只放行 verify-full；不写 sslmode 也放行（那就走 buildPgSsl 的配置）。
+ * 其余一律拒绝启动。这里不替用户改写连接串 —— 那只会把问题藏起来。这个服务签的是
+ * 链上成就，连库那段悄悄不校验，前面做的一切都等于没做。
+ */
+function assertDsnSslMode(dbUrl) {
+  let raw = null
+  if (/^postgres(ql)?:\/\//i.test(dbUrl)) {
+    try {
+      raw = new URL(dbUrl).searchParams.get('sslmode')
+    } catch {
+      return // 连接串本身不合法时交给 pg 报错，这里不重复校验
+    }
+  } else {
+    // libpq 关键字写法：host=... user=... sslmode=no-verify
+    const m = /\bsslmode\s*=\s*['"]?([\w-]+)/i.exec(dbUrl)
+    raw = m ? m[1] : null
+  }
+
+  if (raw === null) return
+  const mode = raw.toLowerCase()
+  if (mode === 'verify-full') return
+
+  // 现在就等于"关掉"的两种
+  if (mode === 'disable' || mode === 'no-verify') {
+    fail(
+      `SUPABASE_DB_URL 里的 sslmode=${mode} 会${mode === 'disable' ? '完全不加密' : '关掉证书校验'}（pg 用连接串的值覆盖显式 ssl 配置），已拒绝启动。\n` +
+        '        正确做法：从连接串里去掉 sslmode，改用 SUPABASE_CA_CERT 指定要信任的 CA；\n' +
+        '        服务端证书由公开 CA 签发时，SUPABASE_CA_CERT 留空即可（走系统 CA）。',
+    )
+  }
+
+  // 现在恰好等价于 verify-full、但 pg 9 会改成 libpq 语义（不校验证书）的别名
+  if (['require', 'verify-ca', 'prefer', 'allow'].includes(mode)) {
+    fail(
+      `SUPABASE_DB_URL 里的 sslmode=${mode} 在当前 pg 里恰好等价于 verify-full，但 pg 9 会改成 libpq 语义（不校验证书）。\n` +
+        '        本服务不依赖这个会变的别名：从连接串里去掉 sslmode，或显式写 sslmode=verify-full。',
+    )
+  }
+
+  fail(
+    `SUPABASE_DB_URL 里的 sslmode=${mode} 不是可接受的值（只接受 verify-full 或留空），已拒绝启动。`,
+  )
+}
+
+assertDsnSslMode(SUPABASE_DB_URL)
+
 const pool = new Pool({
-  connectionString: SUPABASE_DB_URL.replace(/([?&])sslmode=[^&]*/g, '$1').replace(/[?&]$/, ''),
-  ssl: { rejectUnauthorized: false },
+  connectionString: SUPABASE_DB_URL,
+  ssl: buildPgSsl(SUPABASE_CA_CERT),
   max: 4,
 })
 

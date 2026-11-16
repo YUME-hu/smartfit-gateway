@@ -383,6 +383,16 @@ npx hardhat run scripts/deploy.js --network sepolia
    改不了 exp/steps —— 但如果想彻底消除前端参与，可以让签名服务直接读链上 nonce。
 4. 一人一枚（`balanceOf == 0`），适合成就场景；要多个成就需改成按类型分发 tokenId。
 5. 元数据完全上链，所以**改样式要重新部署**（不可升级）。
+6. **数据库连接会校验证书**（`server/sign.js`）。默认用 Node 的系统 CA；服务端证书不是
+   公开 CA 签发时（例如 Supabase 连接池用的是自家 CA，或本地 `supabase start` 的自签
+   证书），必须把对应的 CA 填进 `SUPABASE_CA_CERT`，否则 TLS 握手直接失败。这是刻意的：
+   以前是 `rejectUnauthorized: false`，等于把 TLS 唯一的意义关掉，验了等于没验。
+   另外连接串里**不要带 `sslmode`**：pg 会把连接串解析结果叠加到显式 ssl 配置之上
+   （`sslmode=no-verify` / `disable` 能直接关掉校验），所以服务在启动时只接受
+   `verify-full` 或不写，其余一律拒绝启动 —— 包括 `require` / `prefer` 这类"现在恰好
+   等价于 verify-full、但 pg 9 会改弱"的别名。生产环境必须配置 `SUPABASE_CA_CERT`
+   （或改用公开 CA 签发的直连地址）；本地开发同理，**不要**为了图方便改回"不校验"。
+   PEM 的换行可以写成字面量 `\n`，写法见 `server/.env.example`。
 
 ## 毕设答辩演示指南（Demo Script）
 

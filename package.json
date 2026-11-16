@@ -6,7 +6,7 @@
   "description": "ESP32 手表 → 手机网关 → Supabase → Vue3 看板",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build:test": "tsc -p tsconfig.build.json",
+    "build:test": "tsc -p tsconfig.build.json && node scripts/ensure-cjs-package.cjs tsconfig.build.json",
     "check:sfc": "node scripts/check-sfc.cjs",
     "check:workflow": "node scripts/check-workflow.cjs",
     "check:uniapp": "node scripts/check-uniapp.cjs",

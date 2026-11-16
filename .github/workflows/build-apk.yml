@@ -21,9 +21,26 @@
 # =============================================================================
 name: Build Android APK
 
+# =============================================================================
+# ⚠️ 自动触发已暂停：仓库当前**不是** uni-app CLI 工程
+#
+# 这个工作流假设的是"CLI 工程 + @dcloudio/* 依赖 + build:app 脚本"的形态，
+# 而当前根 package.json 里两者都没有 —— 于是每次 push 都在「构建 App 端资源」
+# 这一步 0 秒失败（线上计数：17 次运行 / 0 次成功 / 17 次失败）。
+#
+# 处理方式：不补一个假的 build:app 去硬凑绿灯，而是承认工程形态不匹配 ——
+#   · 日常门禁交给 verify.yml（类型 / 静态检查 / 单测 / web 构建，真实可跑）
+#   · 本文件保留完整打包流程，改为仅手动触发，作为未来迁移的参考
+#
+# 想恢复自动触发，必须先满足两个前置条件（缺一不可）：
+#   1. 迁移为 CLI 工程：`npx degit dcloudio/uni-preset-vue#vite-ts my-app`，
+#      补 @dcloudio/* 依赖与 build:app 脚本，产物落在 dist/build/app；
+#   2. 配好 vars（UNI_APP_ID / ANDROID_SDK_URL / GRADLE_PROJECT）与签名
+#      secrets，否则 package-apk job 仍会被下面的 if 跳过（不失败，但没产物）。
+# =============================================================================
+
 on:
-  push:
-    branches: [main]
+  # 只在 Actions 页面手动触发；push / pull_request 都不再触发（原因见上）
   workflow_dispatch:
 
 concurrency:

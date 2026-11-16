@@ -10,7 +10,7 @@
     "build": "npm run prepare:assets && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
-    "build:test": "tsc -p tsconfig.test.json",
+    "build:test": "tsc -p tsconfig.test.json && node ../scripts/ensure-cjs-package.cjs tsconfig.test.json",
     "test": "npm run build:test && node --test tests/squatCounter.test.cjs tests/petRules.test.cjs",
     "verify": "npm run typecheck && npm test"
   },
