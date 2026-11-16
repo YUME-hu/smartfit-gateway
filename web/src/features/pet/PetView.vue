@@ -19,7 +19,7 @@ import {
   stageFromLevel,
 } from './petRules'
 import type { PetMood } from './petRules'
-import { usePetState } from './usePetState'
+import { usePetState, type PetSummary } from './usePetState'
 import { useAchievementMint } from '../chain/useAchievementMint'
 
 const props = defineProps<{
@@ -40,8 +40,6 @@ const {
   busy,
   refresh,
   feed,
-  addBonusExp,
-  recordSquat,
 } = usePetState({ supabaseUrl, supabaseAnonKey: supabaseKey, deviceId: DEVICE_ID, enabled })
 
 // ---------------------------------------------------------------- 上链
@@ -91,8 +89,6 @@ const celebrating = ref(false)
 const now = ref(Date.now())
 const events = ref<Array<{ t: number; text: string }>>([])
 const avatarRef = ref<InstanceType<typeof PetAvatar> | null>(null)
-const sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
-let repSeq = 0
 
 let tick: number | undefined
 let refreshTimer: number | undefined
@@ -175,24 +171,116 @@ async function onFeed(): Promise<void> {
   }
 }
 
-/** 调试：真实写 10 条深蹲记录（走 anon INSERT → 触发器 → pet_state） */
-async function simulateSquats(): Promise<void> {
-  for (let i = 0; i < 10; i++) {
-    repSeq++
-    await recordSquat(sessionId, repSeq)
-  }
-  await refresh()
-  log('模拟 10 个深蹲（已真实写库）')
+// ---------------------------------------------------------------- 调试（仅开发环境）
+//
+// 这两条调试路径以前是"真写库"的：奖励经验走 add_bonus_exp RPC，
+// 模拟深蹲走 reps 直插（→ 触发器 → pet_state）。T1.1 收紧 anon 写权限后
+// 它们必然失效，所以改成**纯本地状态模拟**：只改本页的 summary 副本，
+// 不发起任何 Supabase 写请求。
+//
+// 文案与处理函数全部放在 `if (import.meta.env.DEV)` 分支里。生产构建时
+// Vite 把条件替换成 false，整段连同中文文案一起被摇掉 —— 所以产物里是
+// "没有这段 UI"，而不是"渲染了但藏起来"（v-if 单独用做不到这点：
+// 模板里的文案会照样编译进 render 函数）。
+
+interface DevAction {
+  key: string
+  label: string
+  run: () => void
 }
 
-async function onAddExp(): Promise<void> {
-  await addBonusExp(100)
-  log('调试：奖励经验 +100')
+interface DevPanel {
+  tag: string
+  title: string
+  actions: DevAction[]
+  notes: string[]
+}
+
+let devPanel: DevPanel | null = null
+
+/** 调试面板是否可见（prod 构建里 devPanel 恒为 null） */
+const devVisible = computed(() => devPanel !== null)
+const devTag = computed(() => devPanel?.tag ?? '')
+const devTitle = computed(() => devPanel?.title ?? '')
+const devActions = computed<DevAction[]>(() => devPanel?.actions ?? [])
+const devNotes = computed<string[]>(() => devPanel?.notes ?? [])
+
+/** 开发环境下没有后端时的本地基线（只活在内存里，刷新即丢） */
+function devBaseline(): PetSummary {
+  return {
+    device_id: DEVICE_ID,
+    steps_total: 0,
+    reps_total: 0,
+    reps_live: 0,
+    bonus_exp: 0,
+    exp: 0,
+    food_earned: 0,
+    food_used: 0,
+    food: 0,
+    hunger: 80,
+    last_fed_at: null,
+    updated_at: new Date().toISOString(),
+  }
+}
+
+/**
+ * 取本地副本；没连上 Supabase（开发环境常见）就造一份基线，
+ * 这样调试按钮在没有后端的机器上也能演示"升级 / 进化"。
+ */
+function devSummary(): PetSummary {
+  const current = summary.value
+  if (current) return current
+  const seeded = devBaseline()
+  summary.value = seeded
+  return seeded
+}
+
+/**
+ * 本地模拟 +10 个深蹲：深蹲 +10、经验 +15、食物 +2
+ *
+ * 与 pet_state 的生成列同口径（每 10 个深蹲 = 15 经验 / 2 食物）。
+ * 按 10 递增时 floor 的差分恒等于常量，所以这是精确值，不是近似凑数。
+ */
+function simulateSquatsLocally(): void {
+  const s = devSummary()
+  s.reps_total += 10
+  s.exp += 15
+  s.food_earned += 2
+  s.food = Math.max(0, s.food_earned - s.food_used)
+  log('调试：+10 深蹲（仅本地状态，未写库）')
+}
+
+/** 本地模拟 +100 经验（服务端口径是 bonus_exp；这里不动任何表） */
+function simulateBonusExpLocally(): void {
+  const s = devSummary()
+  s.bonus_exp += 100
+  s.exp += 100
+  log('调试：奖励经验 +100（仅本地状态，未写库）')
 }
 
 function forceEvolution(): void {
   avatarRef.value?.playEvolution()
   log('调试：手动播放进化动画')
+}
+
+/**
+ * 调试按钮仅开发环境可用，生产环境通过预置数据演示。
+ * 生产构建中下面的对象字面量与整个分支都会被删除，不产生任何按钮文案。
+ */
+if (import.meta.env.DEV) {
+  devPanel = {
+    tag: '⚙ 调试',
+    title: '调试面板（仅开发环境）',
+    actions: [
+      { key: 'exp', label: '奖励经验 +100', run: simulateBonusExpLocally },
+      { key: 'reps', label: '模拟 10 个深蹲', run: simulateSquatsLocally },
+      { key: 'evo', label: '播一次进化动画', run: forceEvolution },
+    ],
+    notes: [
+      '按钮只更新本页的宠物状态副本，不向 Supabase 写任何数据。',
+      '刷新页面会回到服务端的真实值；生产环境通过预置数据演示。',
+    ],
+  }
 }
 
 // ---------------------------------------------------------------- 生命周期
@@ -350,21 +438,17 @@ onBeforeUnmount(() => {
       <p v-else class="empty">还没有记录，走两步试试</p>
     </section>
 
-    <details class="debug">
+    <!-- 调试面板：内容全部来自 script 里的 DEV 分支（生产构建中不存在） -->
+    <details v-if="devVisible" class="debug">
       <summary>
-        <span class="dev-tag">⚙ 调试</span>
-        调试面板（仅供演示，非正式功能）
+        <span class="dev-tag">{{ devTag }}</span>
+        {{ devTitle }}
       </summary>
       <div class="debug-body">
-        <button @click="onAddExp"><span class="dev-tag">调试</span>奖励经验 +100</button>
-        <button @click="simulateSquats"><span class="dev-tag">调试</span>模拟 10 个深蹲</button>
-        <button @click="forceEvolution()"><span class="dev-tag">调试</span>播一次进化动画</button>
-        <p class="debug-note">
-          这些按钮只为演示"升级 / 进化"效果，正式版本会整个移除：
-          <br />· <strong>奖励经验</strong>只写 <code>bonus_exp</code>，
-          <strong>不修改步数与深蹲记录</strong>（所以成就里的运动数据仍然是真实的）
-          <br />· <strong>模拟深蹲</strong>会真实写入 <code>reps</code> 表（等价于你在深蹲页做 10 个）
-        </p>
+        <button v-for="a in devActions" :key="a.key" @click="a.run()">
+          <span class="dev-tag">{{ devTag }}</span>{{ a.label }}
+        </button>
+        <p v-for="(n, i) in devNotes" :key="i" class="debug-note">{{ n }}</p>
       </div>
     </details>
 
