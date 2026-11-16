@@ -31,9 +31,13 @@ if (!tsconfigArg) {
 
 let ts
 try {
-  ts = require('typescript')
+  // 从"调用方所在的 package"解析 typescript，而不是按脚本自身位置解析。
+  // 原因：根 job 与 web job 各自只装自己的依赖（两次 npm ci），web job 里仓库根
+  // 根本没有 node_modules —— 按脚本位置 require('typescript') 在 CI 会直接失败，
+  // 而本地因为根 node_modules 存在恰好能过（这就是第一次 CI 只红 web job 的原因）。
+  ts = require(require.resolve('typescript', { paths: [process.cwd(), __dirname] }))
 } catch {
-  console.error('[ensure-cjs] 找不到 typescript，请先 npm install')
+  console.error('[ensure-cjs] 找不到 typescript，请先在该目录 npm install')
   process.exit(1)
 }
 
