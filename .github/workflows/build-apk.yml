@@ -56,8 +56,9 @@ concurrency:
 
 env:
   NODE_VERSION: '20'
-  # DCloud 应用的 appid，必须与 manifest.json 里的 "appid" 完全一致（形如 __UNI__A1B2C3D）
-  APP_ID: ${{ vars.UNI_APP_ID }}
+  # DCloud 应用的 appid，必须与 src/manifest.json 里的 "appid" 以及 SDK 的
+  # dcloud_control.xml 完全一致（形如 __UNI__A1B2C3D）
+  UNI_APP_ID: ${{ vars.UNI_APP_ID }}
   # Android 离线 SDK 的 zip 直链（建议自建对象存储或 Release 附件，别依赖第三方网盘）
   ANDROID_SDK_URL: ${{ vars.ANDROID_SDK_URL }}
   # SDK 解压后 Gradle 工程所在目录（不同版本路径不同，按实际调整）
