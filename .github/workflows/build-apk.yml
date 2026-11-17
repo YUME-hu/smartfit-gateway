@@ -348,6 +348,36 @@ jobs:
           PY
           grep -A2 'dcloud_appkey' "$MF" | head -n 4
 
+      - name: 注入蓝牙权限（DCloud 模板只声明了 Android 11 及以下的旧权限）
+        run: |
+          set -eu
+          MF="$MODULE_DIR/src/main/AndroidManifest.xml"
+          [ -f "$MF" ] || { echo "::error::找不到 $MF"; exit 1; }
+          cp "$MF" "$RUNNER_TEMP/AndroidManifest.perm.bak"
+          python3 - "$MF" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          s = open(path, encoding='utf-8').read()
+          add = []
+          if 'android.permission.BLUETOOTH_SCAN' not in s:
+              add.append('<uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />')
+          if 'android.permission.BLUETOOTH_CONNECT' not in s:
+              add.append('<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />')
+          if 'android.hardware.bluetooth_le' not in s:
+              add.append('<uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />')
+          if add:
+              m = re.search(r'(?m)^([ \t]*)<application', s)
+              if not m:
+                  sys.exit('找不到 <application 标签')
+              block = ''.join('    ' + a + '\n' for a in add)
+              s = s[:m.start()] + block + s[m.start():]
+              open(path, 'w', encoding='utf-8').write(s)
+          print('已注入 %d 条权限声明' % len(add))
+          PY
+          echo "== 注入后的蓝牙相关声明 =="
+          grep -n 'BLUETOOTH\|bluetooth_le' "$MF" || true
+          grep -q 'BLUETOOTH_SCAN' "$MF" || { echo "::error::BLUETOOTH_SCAN 注入失败，App 在 Android 12+ 上仍然扫不到设备"; exit 1; }
+
       - name: 改桌面显示名（可选，失败只警告不影响出包）
         env:
           APP_ICON_URL: ${{ vars.APP_ICON_URL }}
