@@ -322,61 +322,41 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "签名配置已改为读环境变量（原 build.gradle 备份为 build.gradle.bak）"
 
-      - name: 把 demo 外壳改名成自己的 App（显示名 / 包名 / 版本号）
+      - name: 改桌面显示名（可选，失败只警告不影响出包）
         env:
-          ANDROID_APPLICATION_ID: ${{ vars.ANDROID_APPLICATION_ID || 'com.smartfit.gateway' }}
           APP_ICON_URL: ${{ vars.APP_ICON_URL }}
         run: |
           set -eu
-          # 离线打包用的是 DCloud 的模板工程当"外壳"，里面的 app_name / applicationId /
-          # 版本号都是模板默认值（HBuilder-Hello / com.android.HelloH5），必须改掉，
-          # 否则装出来就是"HBuilder-Hello"。
-          APP_NAME=$(node -e "const fs=require('fs');const s=fs.readFileSync('dist/build/app/manifest.json','utf8').replace(/^\uFEFF/,'');console.log(JSON.parse(s).name||'SmartFit')")
-          VER_NAME=$(node -e "const fs=require('fs');const s=fs.readFileSync('dist/build/app/manifest.json','utf8').replace(/^\uFEFF/,'');const v=JSON.parse(s).version||{};console.log(typeof v==='object'?v.name:'1.0.0')")
-          VER_CODE=$(node -e "const fs=require('fs');const s=fs.readFileSync('dist/build/app/manifest.json','utf8').replace(/^\uFEFF/,'');const v=JSON.parse(s).version||{};const c=typeof v==='object'?v.code:'1';console.log(parseInt(c,10)||1)")
-          echo "显示名=$APP_NAME  包名=$ANDROID_APPLICATION_ID  版本=$VER_NAME($VER_CODE)"
+          # 只改"壳"的桌面显示名。applicationId / versionCode 保持模板默认值
+          # （com.android.HelloH5 / 1.0）—— 改它们会牵动 DCloud 壳里的 provider authority
+          # 和 manifest 占位符，容易让 Gradle 在 manifest merger 阶段失败；
+          # 毕设只需要桌面名字对，不值得冒这个险。
+          APP_NAME=$(node -e "const fs=require('fs');const s=fs.readFileSync('dist/build/app/manifest.json','utf8').replace(/^\uFEFF/,'');console.log(JSON.parse(s).name||'SmartFit')" || echo SmartFit)
+          echo "目标显示名: $APP_NAME"
 
-          # 1) 桌面显示名
           STRINGS="$MODULE_DIR/src/main/res/values/strings.xml"
-          [ -f "$STRINGS" ] || { echo "::error::找不到 $STRINGS，无法改 App 名称"; exit 1; }
-          cp "$STRINGS" "$STRINGS.bak"
-          sed -i -E "s#(<string name=\"app_name\">)[^<]*(</string>)#\1$APP_NAME\2#" "$STRINGS"
-          cat "$STRINGS"
-          grep -q ">$APP_NAME<" "$STRINGS" || { echo "::error::strings.xml 改写失败"; exit 1; }
-
-          # 2) 包名 + DCloud 的 apk.applicationId 占位符（两者必须一致）
-          GRADLE_FILE="$MODULE_DIR/build.gradle"
-          sed -i -E \
-            -e "s|^([[:space:]]*)applicationId .*|\1applicationId \"$ANDROID_APPLICATION_ID\"|" \
-            -e "s|(\"apk.applicationId\"[[:space:]]*:[[:space:]]*)\"[^\"]*\"|\1\"$ANDROID_APPLICATION_ID\"|" \
-            "$GRADLE_FILE"
-
-          # 3) 版本号与 src/manifest.json 对齐（versionCode 必须随每次发版递增）
-          sed -i -E \
-            -e "s|^([[:space:]]*)versionCode .*|\1versionCode $VER_CODE|" \
-            -e "s|^([[:space:]]*)versionName .*|\1versionName \"$VER_NAME\"|" \
-            "$GRADLE_FILE"
-          echo "== build.gradle 关键行 =="
-          grep -nE 'applicationId|apk.applicationId|versionCode|versionName' "$GRADLE_FILE"
-
-          # 4) dcloud_control.xml 的 appver 也同步（只是元数据，不一致不致命）
-          CTRL=$(find "$SDK_DIR" -name dcloud_control.xml | head -n 1)
-          if [ -n "$CTRL" ]; then
-            sed -i -E "s|(appver=\")[^\"]*(\")|\1$VER_NAME\2|" "$CTRL"
-            echo "dcloud_control.xml: $(cat "$CTRL")"
+          if [ -f "$STRINGS" ]; then
+            cp "$STRINGS" "$STRINGS.bak" || true
+            if sed -i -E "s#(<string name=\"app_name\">)[^<]*(</string>)#\1$APP_NAME\2#" "$STRINGS" && grep -q ">$APP_NAME<" "$STRINGS"; then
+              echo "::notice::桌面显示名已改为 $APP_NAME"
+              cat "$STRINGS"
+            else
+              echo "::warning::strings.xml 改写失败，保留模板名 HBuilder-Hello（不影响出包）"
+              cat "$STRINGS" || true
+            fi
+          else
+            echo "::warning::找不到 $STRINGS，跳过改名（不影响出包）"
           fi
 
-          # 5) 可选：换图标（APP_ICON_URL 指向一张 png）
+          # 可选：换图标（APP_ICON_URL 指向一张 png；失败只警告）
           if [ -n "${APP_ICON_URL:-}" ]; then
             ICON="$MODULE_DIR/src/main/res/drawable-xxhdpi/icon.png"
-            curl -fL --max-time 120 -o "$ICON" "$APP_ICON_URL"
-            echo "已替换图标: $(ls -l "$ICON")"
-          else
-            echo "（未配置 APP_ICON_URL，保留模板图标）"
+            if curl -fL --max-time 120 -o "$ICON" "$APP_ICON_URL"; then
+              echo "::notice::图标已替换"
+            else
+              echo "::warning::图标下载失败，保留模板图标"
+            fi
           fi
-
-          grep -q "applicationId \"$ANDROID_APPLICATION_ID\"" "$GRADLE_FILE" || { echo "::error::包名改写失败"; exit 1; }
-          echo "外壳已改名为 $APP_NAME（$ANDROID_APPLICATION_ID）"
 
       - name: 打印 SDK 的签名配置（首次打包排查用）
         run: |
