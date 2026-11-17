@@ -322,6 +322,31 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "签名配置已改为读环境变量（原 build.gradle 备份为 build.gradle.bak）"
 
+      - name: 注入 DCloud 离线打包 appkey（必需，否则启动报"未配置appkey"）
+        env:
+          DCLOUD_APPKEY: ${{ secrets.DCLOUD_APPKEY }}
+        run: |
+          set -eu
+          MF="$MODULE_DIR/src/main/AndroidManifest.xml"
+          [ -f "$MF" ] || { echo "::error::找不到 $MF"; exit 1; }
+          if [ -z "${DCLOUD_APPKEY:-}" ]; then
+            echo "::error::缺少 Secret DCLOUD_APPKEY。模板里是占位符「开发者需登录 https://dev.dcloud.net.cn/ 申请签名」，不换掉 App 一启动就会弹「未配置appkey或配置错误」。申请时填：appid=__UNI__92A96FD  包名=com.android.HelloH5  证书SHA1=D1:1F:70:7C:21:7E:F9:BF:C9:5D:04:73:1A:D4:E9:71:80:43:64:B4"
+            exit 1
+          fi
+          cp "$MF" "$RUNNER_TEMP/AndroidManifest.xml.bak"
+          python3 - "$MF" "$DCLOUD_APPKEY" <<'PY'
+          import re, sys
+          path, key = sys.argv[1], sys.argv[2]
+          s = open(path, encoding='utf-8').read()
+          pat = re.compile(r'(android:name="dcloud_appkey"\s*\n?\s*android:value=")[^"]*(")')
+          s2, n = pat.subn(lambda m: m.group(1) + key + m.group(2), s)
+          if n == 0:
+              sys.exit('未找到 dcloud_appkey 节点，模板结构可能与预期不同')
+          open(path, 'w', encoding='utf-8').write(s2)
+          print('已写入 appkey，替换节点数=%d' % n)
+          PY
+          grep -A2 'dcloud_appkey' "$MF" | head -n 4
+
       - name: 改桌面显示名（可选，失败只警告不影响出包）
         env:
           APP_ICON_URL: ${{ vars.APP_ICON_URL }}
