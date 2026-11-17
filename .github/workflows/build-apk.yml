@@ -41,6 +41,11 @@
 #   开启后，打包前会自动把 SDK 里 dcloud_control.xml 的 appid 改写成 UNI_APP_ID，
 #   省掉"每次换 SDK 都要手动改一次"的步骤；改写前会打印原文、留 .bak、改完再校验。
 #   默认不开：SDK 的 appid 已手工对齐时不需要它。
+#
+# 可选：vars.ANDROID_SDK_SHA256
+#   填了就在下载后做 sha256sum -c 校验，防下载截断 / 防被人换包；不填则只打印实际哈希。
+#
+# GRADLE_PROJECT 填错不会直接死：若该目录不存在，会自动搜索含 gradlew 的目录并提示。
 # =============================================================================
 name: Build Android APK
 
@@ -175,21 +180,48 @@ jobs:
           du -sh dist/build/app
 
       - name: 下载并解压 Android 离线 SDK
+        env:
+          ANDROID_SDK_SHA256: ${{ vars.ANDROID_SDK_SHA256 }}
         run: |
           set -e
           SDK_ZIP="$RUNNER_TEMP/dcloud-sdk.zip"
           echo "下载 SDK…"
           curl -fL --retry 3 --retry-delay 5 --max-time 1800 -o "$SDK_ZIP" "$ANDROID_SDK_URL"
           ls -lh "$SDK_ZIP"
+
+          # 可选：配置了 ANDROID_SDK_SHA256 就校验包完整性（防截断/防换包）
+          if [ -n "${ANDROID_SDK_SHA256:-}" ]; then
+            echo "校验 SHA256…"
+            echo "$ANDROID_SDK_SHA256  $SDK_ZIP" | sha256sum -c - || {
+              echo "::error::SDK 包 SHA256 与 ANDROID_SDK_SHA256 不符（可能下载被截断或文件被换过）。"
+              exit 1
+            }
+          else
+            echo "（未配置 ANDROID_SDK_SHA256，跳过完整性校验；建议配上）"
+            sha256sum "$SDK_ZIP"
+          fi
+
           mkdir -p "$RUNNER_TEMP/sdk"
           unzip -q "$SDK_ZIP" -d "$RUNNER_TEMP/sdk"
           echo "解压后顶层目录："
           ls -la "$RUNNER_TEMP/sdk"
+
+          # GRADLE_PROJECT 指向的目录不存在时，自动找含 gradlew 的目录（SDK 版本不同目录名会变）
           if [ ! -d "$RUNNER_TEMP/sdk/$GRADLE_PROJECT" ]; then
-            echo "::error::GRADLE_PROJECT=$GRADLE_PROJECT 在 SDK 里不存在；把上面列出的某个目录名填进这个 Variable。"
-            exit 1
+            echo "::warning::GRADLE_PROJECT=$GRADLE_PROJECT 不存在，尝试自动定位 gradlew…"
+            CAND=$(find "$RUNNER_TEMP/sdk" -maxdepth 4 -name gradlew -printf '%h\n' | head -n 1 || true)
+            if [ -z "$CAND" ]; then
+              echo "::error::SDK 里既没有 $GRADLE_PROJECT，也找不到 gradlew。上面是解压后的目录结构。"
+              exit 1
+            fi
+            REL=${CAND#"$RUNNER_TEMP/sdk/"}
+            echo "::notice::自动选中 Gradle 工程：$REL"
+            GRADLE_PROJECT="$REL"
+            echo "GRADLE_PROJECT=$GRADLE_PROJECT" >> "$GITHUB_ENV"
           fi
+
           echo "SDK_DIR=$RUNNER_TEMP/sdk/$GRADLE_PROJECT" >> "$GITHUB_ENV"
+          echo "最终使用 SDK_DIR=$RUNNER_TEMP/sdk/$GRADLE_PROJECT"
 
       - name: 改写 dcloud_control.xml 的 appid（可选，由 Variable 开关控制）
         if: vars.PATCH_DCLOUD_CONTROL == 'true'
@@ -265,9 +297,10 @@ jobs:
           java-version: '17'
 
       - name: Gradle 打包
-        working-directory: ${{ runner.temp }}/sdk/${{ vars.GRADLE_PROJECT }}
         run: |
           set -e
+          cd "$SDK_DIR"
+          echo "Gradle 工程目录: $PWD"
           chmod +x gradlew || true
           ./gradlew assembleRelease --no-daemon --stacktrace
 
