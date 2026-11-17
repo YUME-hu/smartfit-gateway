@@ -29,7 +29,8 @@ App 网关
 2. 小程序/uni-app 运行时**不能监听端口**，起不了 WebSocket 服务端；
 3. 即使能起，Vue 页面在 `https://` 下连 `ws://<手机内网IP>` 会被混合内容策略拦截。
 
-改由 Supabase Realtime 承担这一段 WebSocket：App 只写一行 `device_latest`，
+改由 Supabase Realtime 承担这一段 WebSocket：App 通过 `update_device_latest` RPC 写一行
+`device_latest`（带设备 token 校验，anon 直写已收回），
 数据库变更由 Supabase 推给浏览器。对页面而言效果一致，但不需要手机有公网地址。
 
 ## 需求逐条对应
@@ -859,8 +860,20 @@ app-gateway/
    但看不到步态波形。要看真实波形需把上报频率提回去或改成窗口 min/max。
 3. **时间轴用手机时间**。手表无 RTC，`recorded_at` 是手机收包时刻。
 4. **缓存上限 6 万条（约 3.5 天）**，超出丢最旧并在界面提示。
-5. **anon key 公开**：`migrations` 里给 anon 开放了 insert，拿到 key 的人能写脏数据。
-   加固方案（`x-device-token` 请求头校验）写在迁移文件末尾。
+5. **anon key 公开，写权限已按路径收口**（T1.2b）：
+   - `imu_samples` / `device_latest` 都不再允许 anon 直写，只能走两条
+     `SECURITY DEFINER` RPC：`ingest_samples_v2(p_device_id, p_token, p_samples)` 与
+     `update_device_latest(p_device_id, p_token, p_row)`。两者第一段都调
+     `verify_device_token()`，失败 `raise ... errcode '28000'`。
+     设备 token 库里只存 `sha256`，签发/撤销见 `scripts/issue-device-token.cjs`
+     与 `docs/device-token.md`。
+   - **例外：`reps` 仍对 anon 开放 INSERT**。`source='vision'` 的 reps 是浏览器里做深蹲
+     产生的**用户数据**，不是设备数据；设备 token 存在 APK 里，浏览器没有也不该有，
+     所以这一条没有套 token 模型。决定与触发条件记在 `docs/tech-debt.md`
+     的「reps 仍 anon 可无限 INSERT」。
+   - ⚠️ **破坏性变更（待执行）**：旧签名 `ingest_samples(jsonb)` 计划在 T1.1 删除。
+     删除后**已装在手机上的旧 APK 批量入库会整体失效**（不只是看板降级）。
+     执行前必须先确认手机装的是走 `ingest_samples_v2` 的新包。
 6. **MTU**：一包典型 21 字节，超过默认 ATT MTU 23 的 20 字节有效负载。
    App 会 `setBLEMTU(185)`（iOS 自动协商）。若协商失败导致截断，页面会显示
    「有 N 个包被丢弃」，不会静默入库半截数据。
@@ -878,8 +891,9 @@ BLE 负载：`x,y,z,seq,steps`
 幂等键 `client_key = {deviceId}:{bootEpoch}:{seq}`，如 `watch-01:1:42`。
 `bootEpoch` 由网关通过 "seq 回退 ⇒ 手表重启" 推断并持久化。
 
-写入不走 PostgREST 的 upsert，而是走 `ingest_samples(p_rows jsonb)` 这个
-`SECURITY DEFINER` 函数（`INSERT ... ON CONFLICT DO NOTHING`）。原因见下节。
+写入不走 PostgREST 的 upsert，而是走 `SECURITY DEFINER` 函数
+`ingest_samples_v2(p_device_id, p_token, p_samples)`（`INSERT ... ON CONFLICT DO NOTHING`
++ 设备 token 校验）。旧签名 `ingest_samples(jsonb)` 与它并存，计划在 T1.1 删除。原因见下节。
 
 ## 云端链路实测记录（两个必踩的坑）
 
@@ -903,8 +917,9 @@ PostgREST 把 `resolution` 翻译成 `ON CONFLICT DO UPDATE`，而 DO UPDATE 分
 退化成纯 INSERT 虽然能写，但**一行重复会让整批回滚**：App 重装后本地
 `bootEpoch` 从 0 重来，seq 与历史撞键，这一批的新样本会一起被拒 —— 静默丢数据。
 
-**修法**：写入改走 `ingest_samples(jsonb)` RPC（`SECURITY DEFINER` +
-`ON CONFLICT DO NOTHING`）。重复行跳过、新行照写，anon 只需 EXECUTE。
+**修法**：写入改走 `SECURITY DEFINER` 的 RPC（`ON CONFLICT DO NOTHING`）。
+重复行跳过、新行照写，anon 只需 EXECUTE。T1.2b 起升级为 `ingest_samples_v2`，
+额外要求设备 token（见「必须知道的运行限制」第 5 条）。
 实测：首次调用返回 `1`，同批重试返回 `0`，混合批次只写新行。
 
 ### 坑 2：Realtime 收不到 UPDATE 事件
@@ -940,9 +955,29 @@ supabase db push --remote="postgresql://postgres.<ref>:<密码>@aws-1-ap-southea
 验证脚本从环境变量读连接串，不写死、不入库：
 
 ```powershell
-$env:SUPABASE_DB_URL="postgresql://..."; node scripts/verify-db.cjs
-$env:SUPABASE_URL="https://<ref>.supabase.co"; $env:SUPABASE_KEY="sb_publishable_..."; node scripts/verify-realtime.cjs
+# schema / RLS / RPC / publication
+$env:SUPABASE_DB_URL="postgresql://..."
+node scripts/verify-db.cjs
+
+# Realtime 是否真的推事件（订阅 + 经 update_device_latest 写一行）
+# T1.2b-2 起 device_latest 的 anon 直写已收回，这两个脚本必须带探针 token
+$env:SUPABASE_URL="https://<ref>.supabase.co"
+$env:SUPABASE_KEY="sb_publishable_..."
+$env:DEVICE_ID="verify-probe"
+$env:DEVICE_TOKEN="<给 verify-probe 签发的 token>"
+node scripts/verify-realtime.cjs
+node scripts/diag-realtime.cjs
 ```
+
+探针 token 签一次即可（明文只出现一次）：
+
+```powershell
+$env:SUPABASE_URL="https://<ref>.supabase.co"
+$env:SUPABASE_SERVICE_ROLE_KEY="<service_role key，只在服务端用>"
+node scripts/issue-device-token.cjs --device-id verify-probe --label diag
+```
+
+⚠️ `DEVICE_ID` 别指向 `watch-01`，否则会把真实设备的最新值覆盖成探针数据。
 
 ## 命令
 

@@ -7,7 +7,8 @@
  * 检查项：
  *   1. 表与关键列（含 steps）存在
  *   2. RLS 已开启
- *   3. 策略齐全（device_latest 的 insert/update/select；imu_samples 只走 RPC）
+ *   3. 策略：device_latest 只剩 read latest（写入走 update_device_latest RPC）；
+ *      imu_samples 只走 RPC
  *   4. device_latest 已加入 supabase_realtime publication
  *   5. ingest_samples RPC 存在且是 SECURITY DEFINER
  *   6. RPC 幂等性实测：重复调用返回 0，混合批次只写入新行
@@ -83,17 +84,51 @@ async function main() {
   check('RLS 已在两张表开启', rlsMap.imu_samples === true && rlsMap.device_latest === true, JSON.stringify(rlsMap))
 
   // 3) 策略
+  //    T1.2b-2 之后 device_latest 只允许读：anon 的 insert/update 策略已删，
+  //    写入必须走 update_device_latest RPC —— 所以这里从"三条齐全"改成"只剩 read latest"。
   const pol = await client.query(
     `select tablename, policyname from pg_policies where schemaname = 'public'`,
   )
   const polNames = pol.rows.map((r) => `${r.tablename}:${r.policyname}`)
-  const needPol = [
-    'device_latest:gateway insert latest',
-    'device_latest:gateway update latest',
-    'device_latest:read latest',
-  ]
+
+  const needPol = ['device_latest:read latest']
+  const forbiddenPol = ['device_latest:gateway insert latest', 'device_latest:gateway update latest']
   const missingPol = needPol.filter((p) => !polNames.includes(p))
-  check('device_latest 策略齐全', missingPol.length === 0, missingPol.length ? '缺: ' + missingPol.join(' | ') : `${polNames.length} 条`)
+  const leftoverPol = forbiddenPol.filter((p) => polNames.includes(p))
+  check(
+    'device_latest 只剩 read latest（T1.2b-2 已收回 anon 直写）',
+    missingPol.length === 0 && leftoverPol.length === 0,
+    missingPol.length || leftoverPol.length
+      ? `缺: ${missingPol.join(' | ') || '(无)'} / 不该在: ${leftoverPol.join(' | ') || '(无)'}`
+      : `${polNames.length} 条策略`,
+  )
+
+  // 3.1) T1.2b-2 收口后的唯一写入入口：update_device_latest 存在且 anon 可执行
+  const fnLatest = await client.query(
+    `select p.proname, p.prosecdef, p.pronargs,
+            has_function_privilege('anon', p.oid, 'EXECUTE') as anon_exec,
+            has_function_privilege('authenticated', p.oid, 'EXECUTE') as auth_exec
+       from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public' and p.proname = 'update_device_latest' and p.pronargs = 3`,
+  )
+  const fl = fnLatest.rows[0]
+  check(
+    'update_device_latest RPC 存在且 anon 可执行（T1.2b-2 收口后的唯一写入入口）',
+    !!fl && fl.prosecdef === true && fl.anon_exec === true,
+    fl ? `secdef=${fl.prosecdef} anon=${fl.anon_exec} authenticated=${fl.auth_exec}` : '函数不存在',
+  )
+
+  // 3.2) anon 对 device_latest 只剩 SELECT（insert/update 已 revoke）
+  const anonPriv = await client.query(
+    `select privilege_type from information_schema.role_table_grants
+      where table_schema = 'public' and table_name = 'device_latest' and grantee = 'anon'`,
+  )
+  const anonPrivs = anonPriv.rows.map((r) => r.privilege_type)
+  check(
+    'anon 对 device_latest 只有 SELECT（T1.2b-2 已 revoke insert/update）',
+    anonPrivs.includes('SELECT') && !anonPrivs.includes('INSERT') && !anonPrivs.includes('UPDATE'),
+    anonPrivs.join(',') || '(无显式权限)',
+  )
 
   // imu_samples 不该再允许直连 INSERT（写入只能走 RPC）
   const directInsert = polNames.includes('imu_samples:gateway insert samples')

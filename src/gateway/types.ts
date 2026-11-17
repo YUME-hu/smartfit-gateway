@@ -77,7 +77,7 @@ export const DEFAULT_CONFIG: Omit<GatewayConfig, 'supabaseUrl' | 'supabaseAnonKe
   charUuid: '0000FFF1-0000-1000-8000-00805F9B34FB',
   deviceId: 'watch-01',
   sampleTable: 'imu_samples',
-  sampleRpc: 'ingest_samples',
+  sampleRpc: 'ingest_samples_v2',
   latestTable: 'device_latest',
   syncIntervalMs: 15 * 60 * 1000,
   batchSize: 500,

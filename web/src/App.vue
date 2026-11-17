@@ -2,7 +2,8 @@
 /**
  * SmartFit 实时看板
  *
- * 数据源：Supabase `device_latest`（App 每收到手表一包就 upsert 一行）
+ * 数据源：Supabase `device_latest`（App 每收到手表一包就调 update_device_latest RPC 写一行；
+ *         不能直写表 —— anon 的 insert/update 权限在 T1.2b-2 已收回）
  * 实时性：Supabase Realtime（WebSocket）推 postgres_changes 事件
  *
  * 注意 `steps` 的口径：它是**最近一个 5 秒窗口内的步数**，不是全天累计。

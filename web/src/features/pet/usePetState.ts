@@ -96,26 +96,6 @@ export function usePetState(opts: UsePetStateOptions) {
     summary.value = data as PetSummary
   }
 
-  /** 写一条深蹲记录，走真实的 anon INSERT → 触发器 → pet_state 链路 */
-  async function recordSquat(sessionId: string, repIndex: number): Promise<boolean> {
-    const { error: err } = await client.from('reps').insert({
-      client_key: `${sessionId}:${repIndex}`,
-      session_id: sessionId,
-      source: 'vision',
-      rep_index: repIndex,
-      recorded_at: new Date().toISOString(),
-      min_angle: 95,
-      duration_ms: 1500,
-      device_id: opts.deviceId,
-    })
-    if (err && err.code !== '23505') {
-      error.value = err.message
-      return false
-    }
-    scheduleRefresh()
-    return true
-  }
-
   if (opts.enabled) {
     void refresh()
     channel = client
@@ -152,5 +132,5 @@ export function usePetState(opts: UsePetStateOptions) {
     status.value = 'closed'
   }
 
-  return { summary, status, error, busy, refresh, feed, addBonusExp, recordSquat }
+  return { summary, status, error, busy, refresh, feed, addBonusExp }
 }

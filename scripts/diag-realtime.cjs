@@ -1,21 +1,46 @@
 /**
  * Realtime 诊断：区分「服务没推」和「推了但客户端没收」
  *
- * 手法：不带 filter 订阅整表，然后插入一条**全新的** device_id
- * （用 INSERT 而不是 UPDATE，避开 replica identity 的干扰），
- * 观察 15 秒内是否有任何事件。
+ * 手法：不带 filter 订阅整表，然后对**同一个探针设备**连写两次：
+ *   第 1 次 → 该 device_id 第一次出现，产生 INSERT 事件
+ *   第 2 次（recorded_at 后移 1 秒）→ 产生 UPDATE 事件（依赖 replica identity full）
+ * 于是两种事件都能看到，顺带把 replica identity 的问题一并诊断出来。
+ *
+ * T1.2b-2 起 device_latest 的 anon 直写已收回，写入只能走
+ * update_device_latest(p_device_id, p_token, p_row)，所以需要 DEVICE_ID + DEVICE_TOKEN。
+ *
+ * 用法：
+ *   $env:SUPABASE_URL=...; $env:SUPABASE_KEY=...;
+ *   $env:DEVICE_ID="rt-probe"; $env:DEVICE_TOKEN="<给 rt-probe 签发的 token>"
+ *   node scripts/diag-realtime.cjs
  */
 
 const { createClient } = require('@supabase/supabase-js')
 
 const url = process.env.SUPABASE_URL
 const key = process.env.SUPABASE_KEY
+const deviceId = process.env.DEVICE_ID || 'rt-probe'
+const token = process.env.DEVICE_TOKEN
+
 if (!url || !key) {
   console.error('缺少 SUPABASE_URL / SUPABASE_KEY')
   process.exit(2)
 }
+if (!token) {
+  console.error('缺少 DEVICE_TOKEN —— device_latest 的 anon 直写已收回，必须带 token')
+  console.error('  签发：node scripts/issue-device-token.cjs --device-id ' + deviceId + ' --label diag')
+  process.exit(2)
+}
 
 const client = createClient(url, key)
+
+async function writeLatest(recordedAt) {
+  return client.rpc('update_device_latest', {
+    p_device_id: deviceId,
+    p_token: token,
+    p_row: { recorded_at: recordedAt, x: 0.5, y: 0.5, z: 0.7, steps: 1 },
+  })
+}
 
 async function main() {
   const events = []
@@ -40,24 +65,24 @@ async function main() {
     process.exit(1)
   }
 
-  const dev = 'rt-probe-' + Date.now()
-  console.log('插入新行 device_id=' + dev)
-  const { error } = await client.from('device_latest').insert({
-    device_id: dev,
-    recorded_at: new Date().toISOString(),
-    x: 0.5,
-    y: 0.5,
-    z: 0.7,
-    steps: 1,
-  })
-  if (error) {
-    console.log('写入失败: ' + error.message)
+  console.log('第 1 次写 device_id=' + deviceId + '（期望 INSERT 事件）')
+  const r1 = await writeLatest(new Date(Date.now() - 60000).toISOString())
+  if (r1.error) {
+    console.log('写入失败: ' + r1.error.message)
     process.exit(1)
   }
-  console.log('写入成功，等待 15s 观察事件…')
+  await new Promise((r) => setTimeout(r, 1500))
+
+  console.log('第 2 次写同一设备、recorded_at 后移（期望 UPDATE 事件）')
+  const r2 = await writeLatest(new Date().toISOString())
+  if (r2.error) {
+    console.log('写入失败: ' + r2.error.message)
+    process.exit(1)
+  }
+  console.log('两次写入完成，等待 15s 观察事件…')
 
   const t1 = Date.now()
-  while (events.length === 0 && Date.now() - t1 < 15000) {
+  while (events.length < 2 && Date.now() - t1 < 15000) {
     await new Promise((r) => setTimeout(r, 200))
   }
 
