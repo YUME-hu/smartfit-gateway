@@ -763,6 +763,7 @@ supabase db push           # 应用 supabase/migrations/*.sql
 | var | `UNI_APP_ID` | `manifest.json` 里的 appid，如 `__UNI__A1B2C3D` |
 | var | `ANDROID_SDK_URL` | DCloud Android 离线 SDK 的 zip 直链 |
 | var | `GRADLE_PROJECT` | SDK 内 Gradle 工程目录，如 `HBuilder-Integrate-AS` |
+| var | `PATCH_DCLOUD_CONTROL` | 可选，`true` = 打包前自动把 SDK 的 `dcloud_control.xml` appid 改写成 `UNI_APP_ID` |
 | var | `VITE_DEVICE_ID` | 默认 `watch-01` |
 
 **三个一定会踩的坑**（写在这里省你几小时）：

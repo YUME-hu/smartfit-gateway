@@ -29,16 +29,18 @@
 # 所以 build-assets job 现在应当全绿 —— 之前 17 次全红的根因（没有 build:app
 # 脚本、也没有 @dcloudio 依赖）已经消除。
 #
-# 但 **打成 APK 还缺三样外部资源**（package-apk job 用；缺了该 job 会被 if 跳过，
-# 不失败，但也不会有 APK 产物）：
+# 打成 APK 需要 3 个 Variables + 4 个签名 secrets；**缺任何一个 job 会直接失败并
+# 逐条 ::error:: 报错**（不再静默跳过 —— 静默跳过会让人以为"打包过了"，其实没产物）：
 #   1. vars.UNI_APP_ID       —— 必须与 src/manifest.json 的 appid 完全一致
 #   2. vars.ANDROID_SDK_URL  —— DCloud Android 离线 SDK 的 zip 直链
 #   3. vars.GRADLE_PROJECT   —— SDK 里 Gradle 工程的相对路径
 #   以及 4 个签名 secrets：ANDROID_KEYSTORE_BASE64 / ANDROID_STORE_PASSWORD /
 #   ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD
 #
-# 在补齐之前：本工作流仍可手动触发，跑通 build-assets 并产出 uni-app-assets 工件，
-# 只是不会生成 APK。
+# 可选：vars.PATCH_DCLOUD_CONTROL = true
+#   开启后，打包前会自动把 SDK 里 dcloud_control.xml 的 appid 改写成 UNI_APP_ID，
+#   省掉"每次换 SDK 都要手动改一次"的步骤；改写前会打印原文、留 .bak、改完再校验。
+#   默认不开：SDK 的 appid 已手工对齐时不需要它。
 # =============================================================================
 name: Build Android APK
 
@@ -188,6 +190,26 @@ jobs:
             exit 1
           fi
           echo "SDK_DIR=$RUNNER_TEMP/sdk/$GRADLE_PROJECT" >> "$GITHUB_ENV"
+
+      - name: 改写 dcloud_control.xml 的 appid（可选，由 Variable 开关控制）
+        if: vars.PATCH_DCLOUD_CONTROL == 'true'
+        run: |
+          set -e
+          CTRL=$(find "$SDK_DIR" -name dcloud_control.xml | head -n 1)
+          [ -n "$CTRL" ] || { echo "::error::SDK 里找不到 dcloud_control.xml"; exit 1; }
+          echo "::notice::PATCH_DCLOUD_CONTROL=true —— 自动把 appid 改写为 $UNI_APP_ID"
+          cp "$CTRL" "$CTRL.bak"
+          echo "改写前："
+          cat "$CTRL"
+          # 只替换 appid 属性的值，保留属性名与等号周围原有写法；文件里若有多处 appid 一并替换
+          sed -i -E "s/(appid[[:space:]]*=[[:space:]]*\")[^\"]*(\")/\1${UNI_APP_ID}\2/g" "$CTRL"
+          echo "改写后："
+          cat "$CTRL"
+          if ! grep -Eq "appid[[:space:]]*=[[:space:]]*\"${UNI_APP_ID}\"" "$CTRL"; then
+            echo "::error::自动改写失败：$CTRL 里没找到可替换的 appid 属性（上面是改写后的内容）。请手动改，或把 PATCH_DCLOUD_CONTROL 关掉。"
+            exit 1
+          fi
+          echo "appid 已改写（原文件备份为 $(basename "$CTRL").bak）"
 
       - name: 校验 appid 与 SDK 一致
         run: |
