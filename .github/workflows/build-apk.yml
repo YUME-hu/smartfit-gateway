@@ -47,8 +47,7 @@ on:
   # 每次 push 都被验证。APK 那一步仍受下面 package-apk 的 if 条件门控。
   push:
     branches: [main]
-  workflow_dispatch:
-  # 只在 Actions 页面手动触发；push / pull_request 都不再触发（原因见上）
+  # 也支持在 Actions 页面手动触发
   workflow_dispatch:
 
 concurrency:
