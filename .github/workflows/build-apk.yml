@@ -336,7 +336,9 @@ jobs:
 
           STRINGS="$MODULE_DIR/src/main/res/values/strings.xml"
           if [ -f "$STRINGS" ]; then
-            cp "$STRINGS" "$STRINGS.bak" || true
+            # ⚠️ 备份绝对不能放在 res/ 下：Android 资源合并器只认 .xml，
+            # 出现 strings.xml.bak 会让 :app:mergeReleaseResources 直接失败。
+            cp "$STRINGS" "$RUNNER_TEMP/strings.xml.bak" || true
             if sed -i -E "s#(<string name=\"app_name\">)[^<]*(</string>)#\1$APP_NAME\2#" "$STRINGS" && grep -q ">$APP_NAME<" "$STRINGS"; then
               echo "::notice::桌面显示名已改为 $APP_NAME"
               cat "$STRINGS"
