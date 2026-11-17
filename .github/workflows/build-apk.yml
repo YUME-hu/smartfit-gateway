@@ -183,7 +183,7 @@ jobs:
         env:
           ANDROID_SDK_SHA256: ${{ vars.ANDROID_SDK_SHA256 }}
         run: |
-          set -e
+          set -eu
           SDK_ZIP="$RUNNER_TEMP/dcloud-sdk.zip"
           echo "下载 SDK…"
           curl -fL --retry 3 --retry-delay 5 --max-time 1800 -o "$SDK_ZIP" "$ANDROID_SDK_URL"
@@ -220,8 +220,11 @@ jobs:
             echo "GRADLE_PROJECT=$GRADLE_PROJECT" >> "$GITHUB_ENV"
           fi
 
-          echo "SDK_DIR=$RUNNER_TEMP/sdk/$GRADLE_PROJECT" >> "$GITHUB_ENV"
-          echo "最终使用 SDK_DIR=$RUNNER_TEMP/sdk/$GRADLE_PROJECT"
+          # 先落到 shell 变量：写进 $GITHUB_ENV 只对**后续步骤**生效，本步骤里 $SDK_DIR 还是空的
+          # （这就是第二次 CI 失败的原因：find "" -> "No such file or directory"）
+          SDK_DIR="$RUNNER_TEMP/sdk/$GRADLE_PROJECT"
+          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "最终使用 SDK_DIR=$SDK_DIR"
 
           # 定位 App 模块：DCloud 模板里可能叫 app（HelloUniApp）也可能叫 simpleDemo（Integrate-AS）
           # 注意深度：<project>/app/src/main/AndroidManifest.xml 是从 SDK_DIR 往下第 4 层，
