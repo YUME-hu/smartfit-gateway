@@ -224,10 +224,13 @@ jobs:
           echo "最终使用 SDK_DIR=$RUNNER_TEMP/sdk/$GRADLE_PROJECT"
 
           # 定位 App 模块：DCloud 模板里可能叫 app（HelloUniApp）也可能叫 simpleDemo（Integrate-AS）
-          MANIFEST=$(find "$RUNNER_TEMP/sdk/$GRADLE_PROJECT" -maxdepth 3 -path '*/src/main/AndroidManifest.xml' | head -n 1)
+          # 注意深度：<project>/app/src/main/AndroidManifest.xml 是从 SDK_DIR 往下第 4 层，
+          # maxdepth 3 会漏掉（第一次 CI 就是栽在这里）。
+          MANIFEST=$(find "$SDK_DIR" -maxdepth 5 -path '*/src/main/AndroidManifest.xml' | sort | head -n 1)
           if [ -z "$MANIFEST" ]; then
             echo "::error::在 SDK 工程里找不到 */src/main/AndroidManifest.xml，无法定位 App 模块。"
-            find "$RUNNER_TEMP/sdk/$GRADLE_PROJECT" -maxdepth 2 -type d | head -n 30
+            echo "--- SDK_DIR 下三层目录 ---"
+            find "$SDK_DIR" -maxdepth 3 -type d | head -n 40
             exit 1
           fi
           MODULE_DIR=$(dirname "$(dirname "$(dirname "$MANIFEST")")")
