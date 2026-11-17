@@ -39,6 +39,39 @@ export function normalizeUuid(uuid: string): string {
 
 // ------------------------------------------------------------------ Promise 包装
 
+/**
+ * Android 12+（API 31）把 BLUETOOTH_SCAN / BLUETOOTH_CONNECT 变成了**运行时权限**：
+ * 只在 AndroidManifest 里声明是不够的，必须主动弹窗申请一次。
+ * uni 的 openBluetoothAdapter 不会替你申请，所以扫描前先要一遍。
+ *
+ * 返回**被拒绝**的权限列表（空数组 = 全给了，或当前不是 App 平台）。
+ * 非 App 平台（H5 / 小程序）没有 plus 对象，直接返回空数组。
+ */
+export function ensureBlePermissions(): Promise<string[]> {
+  const plusAny = (globalThis as { plus?: any }).plus
+  if (!plusAny?.android?.requestPermissions) return Promise.resolve([])
+
+  const wanted = [
+    'android.permission.BLUETOOTH_SCAN',
+    'android.permission.BLUETOOTH_CONNECT',
+    'android.permission.ACCESS_FINE_LOCATION',
+    'android.permission.ACCESS_COARSE_LOCATION',
+  ]
+
+  return new Promise((resolve) => {
+    try {
+      plusAny.android.requestPermissions(
+        wanted,
+        (e: { deniedAlways?: string[]; deniedPresent?: string[] }) =>
+          resolve([...(e?.deniedAlways ?? []), ...(e?.deniedPresent ?? [])]),
+        () => resolve(['调用 requestPermissions 失败']),
+      )
+    } catch {
+      resolve(['调用 requestPermissions 抛异常'])
+    }
+  })
+}
+
 function pOpenAdapter(): Promise<void> {
   return new Promise((resolve, reject) => {
     uni.openBluetoothAdapter({
@@ -206,6 +239,14 @@ export class UniBleTransport {
   private async connectOnce(): Promise<void> {
     this.connecting = true
     try {
+      this.opts.onStatus('scanning', '检查蓝牙权限')
+      const denied = await ensureBlePermissions()
+      if (denied.length > 0) {
+        throw new Error(
+          `蓝牙权限被拒绝（${denied.join(', ')}）。请到 系统设置 → 应用 → SmartFit → 权限 里把"附近的设备"设为允许，然后重试`,
+        )
+      }
+
       this.opts.onStatus('scanning', '打开蓝牙适配器')
 
       await pOpenAdapter()
