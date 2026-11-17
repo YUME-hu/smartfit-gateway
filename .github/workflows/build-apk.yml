@@ -19,27 +19,35 @@
 #      版本必须与 package.json 里 @dcloudio 各包版本**一致**，否则启动白屏。
 #   3. 需要签名密钥（secrets.ANDROID_KEYSTORE_BASE64 等）。
 # =============================================================================
+# 2026-11-17 更新：工程已迁到 uni-app CLI 布局，`npm run build:app` 现在真的能跑
+#
+#   · 入口都在 src/ 下：pages.json / manifest.json / App.vue / main.js
+#   · 依赖：@dcloudio/uni-app · uni-app-plus · uni-components · uni-h5
+#           + vite-plugin-uni + vite 5.2.8（见根 package.json）
+#   · 本地实测：`uni build -p app` → dist/build/app（18 个文件 / 0.91 MB / 9s）
+#
+# 所以 build-assets job 现在应当全绿 —— 之前 17 次全红的根因（没有 build:app
+# 脚本、也没有 @dcloudio 依赖）已经消除。
+#
+# 但 **打成 APK 还缺三样外部资源**（package-apk job 用；缺了该 job 会被 if 跳过，
+# 不失败，但也不会有 APK 产物）：
+#   1. vars.UNI_APP_ID       —— 必须与 src/manifest.json 的 appid 完全一致
+#   2. vars.ANDROID_SDK_URL  —— DCloud Android 离线 SDK 的 zip 直链
+#   3. vars.GRADLE_PROJECT   —— SDK 里 Gradle 工程的相对路径
+#   以及 4 个签名 secrets：ANDROID_KEYSTORE_BASE64 / ANDROID_STORE_PASSWORD /
+#   ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD
+#
+# 在补齐之前：本工作流仍可手动触发，跑通 build-assets 并产出 uni-app-assets 工件，
+# 只是不会生成 APK。
+# =============================================================================
 name: Build Android APK
 
-# =============================================================================
-# ⚠️ 自动触发已暂停：仓库当前**不是** uni-app CLI 工程
-#
-# 这个工作流假设的是"CLI 工程 + @dcloudio/* 依赖 + build:app 脚本"的形态，
-# 而当前根 package.json 里两者都没有 —— 于是每次 push 都在「构建 App 端资源」
-# 这一步 0 秒失败（线上计数：17 次运行 / 0 次成功 / 17 次失败）。
-#
-# 处理方式：不补一个假的 build:app 去硬凑绿灯，而是承认工程形态不匹配 ——
-#   · 日常门禁交给 verify.yml（类型 / 静态检查 / 单测 / web 构建，真实可跑）
-#   · 本文件保留完整打包流程，改为仅手动触发，作为未来迁移的参考
-#
-# 想恢复自动触发，必须先满足两个前置条件（缺一不可）：
-#   1. 迁移为 CLI 工程：`npx degit dcloudio/uni-preset-vue#vite-ts my-app`，
-#      补 @dcloudio/* 依赖与 build:app 脚本，产物落在 dist/build/app；
-#   2. 配好 vars（UNI_APP_ID / ANDROID_SDK_URL / GRADLE_PROJECT）与签名
-#      secrets，否则 package-apk job 仍会被下面的 if 跳过（不失败，但没产物）。
-# =============================================================================
-
 on:
+  # 2026-11-17：CLI 迁移完成后恢复 push 触发 —— 至少保证"app 资源构建得出来"这件事
+  # 每次 push 都被验证。APK 那一步仍受下面 package-apk 的 if 条件门控。
+  push:
+    branches: [main]
+  workflow_dispatch:
   # 只在 Actions 页面手动触发；push / pull_request 都不再触发（原因见上）
   workflow_dispatch:
 

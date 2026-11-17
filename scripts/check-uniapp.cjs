@@ -39,14 +39,15 @@ function readJson(rel) {
 }
 
 // ---------------------------------------------------------------- pages.json
-const pagesJson = readJson('pages.json')
+// CLI 工程布局：pages.json / manifest.json / App.vue / main.js 都在 src/ 下
+const pagesJson = readJson('src/pages.json')
 if (pagesJson) {
   ok('pages.json 解析通过')
   const pages = pagesJson.pages || []
   if (pages.length === 0) fail('pages.json 里没有 pages')
 
   for (const p of pages) {
-    const file = path.join(ROOT, p.path + '.vue')
+    const file = path.join(ROOT, 'src', p.path + '.vue')
     if (fs.existsSync(file)) {
       ok(`页面 ${p.path} → ${p.path}.vue`)
     } else {
@@ -63,7 +64,7 @@ if (pagesJson) {
 }
 
 // ---------------------------------------------------------------- manifest.json
-const manifest = readJson('manifest.json')
+const manifest = readJson('src/manifest.json')
 if (manifest) {
   ok('manifest.json 解析通过')
   if (manifest.name) ok(`App 名称: ${manifest.name}`)
@@ -102,11 +103,11 @@ if (manifest) {
 }
 
 // ---------------------------------------------------------------- 入口文件
-for (const f of ['App.vue', 'main.js']) {
+for (const f of ['src/App.vue', 'src/main.js']) {
   if (!fs.existsSync(path.join(ROOT, f))) fail(`缺少入口文件 ${f}`)
 }
-const appVue = fs.existsSync(path.join(ROOT, 'App.vue'))
-  ? fs.readFileSync(path.join(ROOT, 'App.vue'), 'utf8')
+const appVue = fs.existsSync(path.join(ROOT, 'src/App.vue'))
+  ? fs.readFileSync(path.join(ROOT, 'src/App.vue'), 'utf8')
   : ''
 if (appVue) {
   // 先去掉注释，否则文档里写的 "<template>" 字样会被误判成真模板块
@@ -120,8 +121,8 @@ if (appVue) {
     ok('App.vue 无 <template>（符合 uni-app 要求）')
   }
 }
-const mainJs = fs.existsSync(path.join(ROOT, 'main.js'))
-  ? fs.readFileSync(path.join(ROOT, 'main.js'), 'utf8')
+const mainJs = fs.existsSync(path.join(ROOT, 'src/main.js'))
+  ? fs.readFileSync(path.join(ROOT, 'src/main.js'), 'utf8')
   : ''
 if (mainJs) {
   if (/export\s+function\s+createApp/.test(mainJs) && /createSSRApp/.test(mainJs)) {
@@ -132,7 +133,7 @@ if (mainJs) {
 }
 
 // ---------------------------------------------------------------- 相对 import 解析
-const SCAN_DIRS = ['pages', 'components', 'src']
+const SCAN_DIRS = ['src']
 const EXTS = ['', '.ts', '.js', '.vue']
 
 function resolveImport(fromFile, spec) {

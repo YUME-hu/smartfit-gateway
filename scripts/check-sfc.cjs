@@ -14,7 +14,7 @@ const path = require('node:path')
 const sfc = require('@vue/compiler-sfc')
 
 const ROOT = path.resolve(__dirname, '..')
-const FILES = ['pages/gateway/index.vue', 'components/MiniChart.vue']
+const FILES = ['src/pages/gateway/index.vue', 'src/components/MiniChart.vue']
 
 let failed = 0
 
