@@ -112,89 +112,149 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Job 2：把上面的产物塞进 DCloud 离线 SDK，Gradle 打出 APK。
-  # 缺变量时跳过而不是失败 —— 这样只配了 Supabase secret 的人也能用 Job 1。
+  # Job 2：把 Job 1 的产物塞进 DCloud 离线 SDK，Gradle 打出 release APK。
+  #
+  # 触发：只手动 Run workflow 时执行（push 只跑 Job 1 的资源构建检查）。
+  # 前置：3 个 Variables + 6 个 Secrets。缺任何一个都**直接失败并逐条报错**，
+  #       不再静默跳过 —— 静默跳过会让人以为"打包过了"，其实没有 APK 产物。
+  # 产物：artifact `apk`（out/smartfit-<sha7>.apk）
   # ---------------------------------------------------------------------------
   package-apk:
     name: 打包 APK
     needs: build-assets
-    if: ${{ vars.ANDROID_SDK_URL != '' && vars.UNI_APP_ID != '' }}
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - name: 校验前置变量与密钥
+        env:
+          UNI_APP_ID: ${{ vars.UNI_APP_ID }}
+          ANDROID_SDK_URL: ${{ vars.ANDROID_SDK_URL }}
+          GRADLE_PROJECT: ${{ vars.GRADLE_PROJECT }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: |
+          set -u
+          missing=0
+          need_var() { [ -n "${!1:-}" ] || { echo "::error::缺少 Variable  $1 —— $2"; missing=1; }; }
+          need_sec() { [ -n "${!1:-}" ] || { echo "::error::缺少 Secret    $1 —— $2"; missing=1; }; }
 
-      - uses: actions/setup-node@v4
+          need_var UNI_APP_ID        "Settings → Variables：DCloud appid，须与 src/manifest.json、SDK 的 dcloud_control.xml 一致"
+          need_var ANDROID_SDK_URL   "Settings → Variables：DCloud Android 离线 SDK 的 zip 直链"
+          need_var GRADLE_PROJECT    "Settings → Variables：SDK zip 里 Gradle 工程的相对路径（常见为 SDK）"
+          need_sec ANDROID_KEYSTORE_BASE64 "Settings → Secrets：release.keystore 的 base64"
+          need_sec ANDROID_STORE_PASSWORD  "Settings → Secrets：keystore 密码"
+          need_sec ANDROID_KEY_ALIAS       "Settings → Secrets：key alias"
+          need_sec ANDROID_KEY_PASSWORD    "Settings → Secrets：key 密码"
+          need_sec VITE_SUPABASE_URL       "Settings → Secrets：Supabase 项目 URL"
+          need_sec VITE_SUPABASE_ANON_KEY  "Settings → Secrets：Supabase anon key"
+
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::打包前置条件不完整（见上面逐条 ::error::）。补齐后重新 Run workflow。"
+            exit 1
+          fi
+          echo "前置检查通过：3 个 Variable + 6 个 Secret 均已配置"
+
+      - name: 取回 build-assets 产物
+        uses: actions/download-artifact@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
+          name: uni-app-assets
+          path: dist/build/app
 
-      - name: 安装依赖
+      - name: 校验产物
         run: |
-          if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
-
-      - name: 注入 .env
-        run: |
-          cat > .env <<'EOF'
-          VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }}
-          VITE_DEVICE_ID=${{ vars.VITE_DEVICE_ID }}
-          EOF
-
-      - name: 构建 App 端资源
-        run: npm run build:app
+          set -e
+          test -f dist/build/app/app-service.js || { echo "::error::产物里没有 app-service.js，build-assets 可能没成功"; exit 1; }
+          du -sh dist/build/app
 
       - name: 下载并解压 Android 离线 SDK
         run: |
           set -e
-          SDK_ZIP=$RUNNER_TEMP/dcloud-sdk.zip
-          curl -fL --retry 3 --retry-delay 5 -o "$SDK_ZIP" "$ANDROID_SDK_URL"
+          SDK_ZIP="$RUNNER_TEMP/dcloud-sdk.zip"
+          echo "下载 SDK…"
+          curl -fL --retry 3 --retry-delay 5 --max-time 1800 -o "$SDK_ZIP" "$ANDROID_SDK_URL"
+          ls -lh "$SDK_ZIP"
           mkdir -p "$RUNNER_TEMP/sdk"
           unzip -q "$SDK_ZIP" -d "$RUNNER_TEMP/sdk"
-          echo "SDK 顶层目录："
+          echo "解压后顶层目录："
           ls -la "$RUNNER_TEMP/sdk"
+          if [ ! -d "$RUNNER_TEMP/sdk/$GRADLE_PROJECT" ]; then
+            echo "::error::GRADLE_PROJECT=$GRADLE_PROJECT 在 SDK 里不存在；把上面列出的某个目录名填进这个 Variable。"
+            exit 1
+          fi
+          echo "SDK_DIR=$RUNNER_TEMP/sdk/$GRADLE_PROJECT" >> "$GITHUB_ENV"
+
+      - name: 校验 appid 与 SDK 一致
+        run: |
+          set -e
+          CTRL=$(find "$SDK_DIR" -name dcloud_control.xml | head -n 1)
+          [ -n "$CTRL" ] || { echo "::error::SDK 里找不到 dcloud_control.xml"; exit 1; }
+          echo "dcloud_control.xml: $CTRL"
+          cat "$CTRL"
+          grep -q "$UNI_APP_ID" "$CTRL" || {
+            echo "::error::appid 不一致：UNI_APP_ID=$UNI_APP_ID 不在 dcloud_control.xml 里。改 SDK 的 dcloud_control.xml，或把 src/manifest.json 的 appid 改成 SDK 里那个。"
+            exit 1
+          }
 
       - name: 把前端产物放进 SDK 的 assets
         run: |
           set -e
-          TARGET="$RUNNER_TEMP/sdk/$GRADLE_PROJECT/app/src/main/assets/apps/$APP_ID"
+          TARGET="$SDK_DIR/app/src/main/assets/apps/$UNI_APP_ID"
           mkdir -p "$TARGET"
+          rm -rf "$TARGET/www"
           cp -r dist/build/app "$TARGET/www"
-          # appid 必须与 SDK 里的 dcloud_control.xml 一致，否则启动白屏
-          find "$RUNNER_TEMP/sdk/$GRADLE_PROJECT" -name dcloud_control.xml -print -exec cat {} \;
+          test -f "$TARGET/www/app-service.js"
           echo "已写入 $TARGET/www"
 
       - name: 恢复签名密钥
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -e
-          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.keystore"
-          cat > "$RUNNER_TEMP/keystore.properties" <<EOF
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          test -s "$RUNNER_TEMP/release.keystore"
+          cat > "$SDK_DIR/keystore.properties" <<EOF
           storeFile=$RUNNER_TEMP/release.keystore
-          storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}
-          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
-          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          storePassword=$ANDROID_STORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
           EOF
-          echo "签名文件已就绪（未回显密码）"
+          chmod 600 "$RUNNER_TEMP/release.keystore"
+          echo "keystore 与 keystore.properties 已就绪（未回显密码）"
 
-      - name: 设置 JDK 17
-        uses: actions/setup-java@v4
+      - name: 打印 SDK 的签名配置（首次打包排查用）
+        run: |
+          echo "== $SDK_DIR/app/build.gradle 里的 signingConfigs =="
+          grep -n -A8 "signingConfigs" "$SDK_DIR/app/build.gradle" || echo "(没找到 signingConfigs 段)"
+          echo "== keystore.properties 位置 =="
+          ls -l "$SDK_DIR/keystore.properties" || true
+
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Gradle 打包
-        working-directory: ${{ runner.temp }}/sdk/${{ env.GRADLE_PROJECT }}
+        working-directory: ${{ runner.temp }}/sdk/${{ vars.GRADLE_PROJECT }}
         run: |
           set -e
           chmod +x gradlew || true
           ./gradlew assembleRelease --no-daemon --stacktrace
 
-      - name: 收集并重命名 APK
+      - name: 收集 APK
         run: |
           set -e
-          SRC=$(find "$RUNNER_TEMP/sdk/$GRADLE_PROJECT" -name "*-release*.apk" | head -n 1)
-          test -n "$SRC" || { echo "没找到 APK，检查 Gradle 输出"; exit 1; }
+          SRC=$(find "$SDK_DIR" -name "*-release*.apk" | head -n 1)
+          [ -n "$SRC" ] || { echo "::error::没找到 *-release*.apk，检查 Gradle 日志"; exit 1; }
           mkdir -p out
-          cp "$SRC" "out/fitness-watch-${GITHUB_SHA::7}.apk"
+          cp "$SRC" "out/smartfit-${GITHUB_SHA::7}.apk"
           ls -lh out
 
       - uses: actions/upload-artifact@v4
