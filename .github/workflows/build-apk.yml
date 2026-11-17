@@ -101,6 +101,7 @@ jobs:
           VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }}
           VITE_DEVICE_ID=${{ vars.VITE_DEVICE_ID }}
+          VITE_DEVICE_TOKEN=${{ secrets.VITE_DEVICE_TOKEN }}
           EOF
 
       - name: 构建 App 端资源
