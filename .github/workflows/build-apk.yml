@@ -223,6 +223,17 @@ jobs:
           echo "SDK_DIR=$RUNNER_TEMP/sdk/$GRADLE_PROJECT" >> "$GITHUB_ENV"
           echo "最终使用 SDK_DIR=$RUNNER_TEMP/sdk/$GRADLE_PROJECT"
 
+          # 定位 App 模块：DCloud 模板里可能叫 app（HelloUniApp）也可能叫 simpleDemo（Integrate-AS）
+          MANIFEST=$(find "$RUNNER_TEMP/sdk/$GRADLE_PROJECT" -maxdepth 3 -path '*/src/main/AndroidManifest.xml' | head -n 1)
+          if [ -z "$MANIFEST" ]; then
+            echo "::error::在 SDK 工程里找不到 */src/main/AndroidManifest.xml，无法定位 App 模块。"
+            find "$RUNNER_TEMP/sdk/$GRADLE_PROJECT" -maxdepth 2 -type d | head -n 30
+            exit 1
+          fi
+          MODULE_DIR=$(dirname "$(dirname "$(dirname "$MANIFEST")")")
+          echo "MODULE_DIR=$MODULE_DIR" >> "$GITHUB_ENV"
+          echo "App 模块目录: $MODULE_DIR"
+
       - name: 改写 dcloud_control.xml 的 appid（可选，由 Variable 开关控制）
         if: vars.PATCH_DCLOUD_CONTROL == 'true'
         run: |
@@ -258,14 +269,14 @@ jobs:
       - name: 把前端产物放进 SDK 的 assets
         run: |
           set -e
-          TARGET="$SDK_DIR/app/src/main/assets/apps/$UNI_APP_ID"
+          TARGET="$MODULE_DIR/src/main/assets/apps/$UNI_APP_ID"
           mkdir -p "$TARGET"
           rm -rf "$TARGET/www"
           cp -r dist/build/app "$TARGET/www"
           test -f "$TARGET/www/app-service.js"
           echo "已写入 $TARGET/www"
 
-      - name: 恢复签名密钥
+      - name: 适配签名配置（把模板写死的 test.jks 换成我们的 keystore）
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
@@ -273,23 +284,44 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -e
+          GRADLE_FILE="$MODULE_DIR/build.gradle"
+          [ -f "$GRADLE_FILE" ] || { echo "::error::$GRADLE_FILE 不存在，无法改签名配置"; exit 1; }
+
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
-          test -s "$RUNNER_TEMP/release.keystore"
-          cat > "$SDK_DIR/keystore.properties" <<EOF
-          storeFile=$RUNNER_TEMP/release.keystore
-          storePassword=$ANDROID_STORE_PASSWORD
-          keyAlias=$ANDROID_KEY_ALIAS
-          keyPassword=$ANDROID_KEY_PASSWORD
-          EOF
+          test -s "$RUNNER_TEMP/release.keystore" || { echo "::error::keystore 解码后是空文件，检查 ANDROID_KEYSTORE_BASE64"; exit 1; }
           chmod 600 "$RUNNER_TEMP/release.keystore"
-          echo "keystore 与 keystore.properties 已就绪（未回显密码）"
+
+          echo "== 改写前 =="
+          sed -n '/signingConfigs/,/^    }/p' "$GRADLE_FILE" | head -n 12
+
+          cp "$GRADLE_FILE" "$GRADLE_FILE.bak"
+          # DCloud 模板里签名是写死的（key0 / 123456 / test.jks）——不改的话 APK 会用 demo 的公开
+          # 测试证书签出来：构建绿、能装，但不是你的签名，以后无法覆盖升级。这里统一改成读环境变量。
+          sed -i -E \
+            -e "s|^([[:space:]]*)keyAlias .*|\1keyAlias System.getenv(\"SMARTFIT_KEY_ALIAS\")|" \
+            -e "s|^([[:space:]]*)keyPassword .*|\1keyPassword System.getenv(\"SMARTFIT_KEY_PASSWORD\")|" \
+            -e "s|^([[:space:]]*)storeFile .*|\1storeFile file(System.getenv(\"SMARTFIT_KEYSTORE\"))|" \
+            -e "s|^([[:space:]]*)storePassword .*|\1storePassword System.getenv(\"SMARTFIT_STORE_PASSWORD\")|" \
+            "$GRADLE_FILE"
+
+          echo "== 改写后 =="
+          sed -n '/signingConfigs/,/^    }/p' "$GRADLE_FILE" | head -n 12
+          grep -q 'SMARTFIT_KEYSTORE' "$GRADLE_FILE" || { echo "::error::自动改写签名配置失败：build.gradle 里没有找到可替换的 storeFile 行"; exit 1; }
+
+          {
+            echo "SMARTFIT_KEYSTORE=$RUNNER_TEMP/release.keystore"
+            echo "SMARTFIT_STORE_PASSWORD=$ANDROID_STORE_PASSWORD"
+            echo "SMARTFIT_KEY_ALIAS=$ANDROID_KEY_ALIAS"
+            echo "SMARTFIT_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "签名配置已改为读环境变量（原 build.gradle 备份为 build.gradle.bak）"
 
       - name: 打印 SDK 的签名配置（首次打包排查用）
         run: |
-          echo "== $SDK_DIR/app/build.gradle 里的 signingConfigs =="
-          grep -n -A8 "signingConfigs" "$SDK_DIR/app/build.gradle" || echo "(没找到 signingConfigs 段)"
-          echo "== keystore.properties 位置 =="
-          ls -l "$SDK_DIR/keystore.properties" || true
+          echo "== $MODULE_DIR/build.gradle 里的 signingConfigs =="
+          sed -n '/signingConfigs/,/^    }/p' "$MODULE_DIR/build.gradle" || true
+          echo "== buildTypes 里的 signingConfig 引用 =="
+          grep -n "signingConfig " "$MODULE_DIR/build.gradle" || true
 
       - uses: actions/setup-java@v4
         with:
