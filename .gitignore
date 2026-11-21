@@ -15,3 +15,6 @@ web/public/wasm/
 
 # 固件串口日志是实测证据，保留（上面的 *.log 只针对本地临时日志）
 !firmware/logs/*.log
+
+# arduino-cli 在 sketch 目录里生成的中间产物
+firmware/*/build/

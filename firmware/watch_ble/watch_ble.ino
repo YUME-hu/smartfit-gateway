@@ -160,8 +160,8 @@ static bool initSensor()
                   addr, activeSda, activeScl);
 
     // 量程 ±4g，输出速率 250Hz
-    // 注意：loop 只在发包时读一次（5s 一次），所以这里的高 ODR 只影响
-    // 单次采样的新鲜度，不影响功耗；想要步数统计需改成窗口内多次采样。
+    // 注意：loop 现在每 40ms 读一次（25Hz，见 SAMPLE_PERIOD_MS），高 ODR 的意义
+    // 是保证每次读取都拿到新解算值；功耗代价来自"连续采样"本身，与 ODR 无关。
     if (qmi.configAccelerometer(SensorQMI8658::ACC_RANGE_4G,
                                 SensorQMI8658::ACC_ODR_250Hz,
                                 SensorQMI8658::LPF_MODE_0) != 0) {

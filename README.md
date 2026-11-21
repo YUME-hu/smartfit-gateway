@@ -834,7 +834,7 @@ app-gateway/
 │  │  └─ SquatView.vue            摄像头/视频双模式 UI
 │  ├─ public/models/              pose_landmarker_lite.task（入库）
 │  ├─ public/wasm/                MediaPipe wasm（脚本生成，不入库）
-│  ├─ tests/squatCounter.test.cjs 16 条算法单测
+│  ├─ tests/squatCounter.test.cjs 深蹲状态机单测（条数见 npm test 输出）
 │  └─ vite.config.ts              dev 端口 5199
 ├─ firmware/                      ESP32 固件（计步 + BLE）
 ├─ supabase/migrations/           Supabase CLI 迁移（唯一 schema 来源）
@@ -860,7 +860,10 @@ app-gateway/
    默认没有，得写原生插件）与 iOS `bluetooth-central` 后台模式。
 2. **5 秒窗口 ≠ 原始波形**。图表画的是每 5 秒的均值序列，能看出"动没动"，
    但看不到步态波形。要看真实波形需把上报频率提回去或改成窗口 min/max。
-3. **时间轴用手机时间**。手表无 RTC，`recorded_at` 是手机收包时刻。
+3. **时间轴用手机时间**。`recorded_at` 是手机收包时刻，不是手表采样时刻。
+   板上其实有 RTC（PCF85063，I2C 0x51，启动时的总线扫描能看到它），但**固件从未初始化**，
+   所以第一阶段没有手表侧时间戳。真实时间戳（`device_ts`）是第二阶段的工作；
+   断电后能否保时取决于有无备份电源，待探针确认后再写结论。
 4. **缓存上限 6 万条（约 3.5 天）**，超出丢最旧并在界面提示。
 5. **anon key 公开，写权限已按路径收口**（T1.2b）：
    - `imu_samples` / `device_latest` 都不再允许 anon 直写，只能走两条
