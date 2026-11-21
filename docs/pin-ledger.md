@@ -322,8 +322,61 @@ $fqbn='esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=32M,PSRAM=opi,F
 | 固件 | 用途 | 状态 |
 | --- | --- | --- |
 | `firmware/watch_ble` | 第一阶段正式固件（BLE + 计步） | 已编译，回滚包在 `.tools\build\watch_ble` |
+| `firmware/watch_lvgl` | **M1a 主固件**：LVGL 9 PARTIAL + 双核任务分离 | 已上板，见 §11 |
 | `firmware/m0b_probe` | 显示推送耗时 + 采样共存 A/B（§9.1–9.4） | 已实测，结论已入档 |
 | `firmware/power_probe` | 电源/电池/按键/RTC 诊断（§9.5–9.7），屏幕显示心跳 | 已烧录，等待两次物理验证 |
 | `firmware/step_selftest` | 计步算法合成信号回归 | 第一阶段遗留 |
+
+---
+
+## 11. M1a 实测结果（2026-11-21 深夜）
+
+固件：`firmware/watch_lvgl`（LVGL 9.3.0 + Arduino_GFX CO5300 + QMI8658 双核解耦）
+
+### 11.1 字节序优化：1.64×（验证了 M0b 的猜测）
+
+```
+[BENCH] 50 行条带 41KB: RGB(带交换)=5.38ms  BE(免交换)=3.28ms  加速=1.64x
+```
+
+- 换 `draw16bitBeRGBBitmap` 后省掉逐像素字节交换，41KB 从 5.38ms 降到 3.28ms（有效带宽 7.7 → 12.5 MB/s）。
+- 但仍远低于 QSPI 理论值 → 剩余瓶颈是 SPI 写入本身，不是字节序。**这条优化值得做，但别指望它带来数量级提升。**
+
+### 11.2 帧率与刷新开销（持续动画状态下）
+
+| 指标 | 实测 |
+| --- | --- |
+| 帧率 | **62 fps**（310–313 帧/5s）—— 上限是 `LV_DEF_REFR_PERIOD=16ms`，不是算力 |
+| flush 次数 | 77 次/s（约 2.5 次/帧） |
+| 单次 flush | 平均 **608 µs**，最大 1.2 ms |
+| QSPI 占空比 | **4.7%**（77 × 0.608ms / 1000ms） |
+
+→ 显示通路余量很大，M1b 的"≥30fps"验收已经提前达标（62fps 且只用了 5% 的显示带宽）。
+
+### 11.3 采样共存
+
+所有窗口 **125/125，丢点 0.00%**，在 62fps 持续刷屏下同样为零。
+结论与 M0b 一致：**双核任务分离（采样 core1 优先级 5 / LVGL core0 优先级 3 + I2C 互斥）成立**。
+
+### 11.4 两个必须记住的坑
+
+1. **`lv_timer_handler()` 的调用节奏就是帧率上限**。第一版把它放在 200ms 的 UI 更新循环里 → 读数只有 5fps。
+   而且这个 5fps 是"需求驱动"的（内容不变就不重绘），**不是能力上限**——要测真实帧率，界面上必须有一个持续动画的对象。
+2. **丢点率的分母不能用整数除法**。`expected = elapsed / 40` 会系统性少算（5001ms→125，实际可能采到 126），
+   累计起来会伪造出约 **0.8%** 的"丢点"。已改成四舍五入：`(elapsed + 20) / 40`。
+   → 这条同步进 `docs/实验方案-M4a.md` §2.1：**分母按浮点或四舍五入**。
+
+### 11.5 目录结构说明（构建相关）
+
+- `firmware/watch_lvgl/lv_conf.h`：**项目自带**的 LVGL 配置（从 `lv_conf_template.h` 派生），
+  通过 `-DLV_CONF_INCLUDE_SIMPLE` 让 LVGL 优先用 sketch 目录里的这份，而不是全局的 `libraries/lv_conf.h`。
+  好处：配置跟固件一起进仓库，换机器构建不会因为缺 `lv_conf.h` 失败。
+- 构建命令要带这个 flag：
+
+```powershell
+& $cli --config-file $cfg compile --fqbn $fqbn `
+  --build-property 'compiler.cpp.extra_flags=-DLV_CONF_INCLUDE_SIMPLE' `
+  --output-dir $out <sketch_dir>
+```
 
 
