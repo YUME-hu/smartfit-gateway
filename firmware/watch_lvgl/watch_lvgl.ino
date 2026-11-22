@@ -39,6 +39,7 @@ LV_FONT_DECLARE(cjk16);
 #define BUF_LINES        50      // 410×50×2 = 41KB
 #define STEP_TARGET      8000    // 步数目标（进度用，M2 可由手机下发）
 #define CAL_SCREEN       0       // 1 = 开机先显示校准图案（排查色序/可见区用）
+#define ATT_LOG          0       // 1 = 以 10Hz 打印姿态（标定用；平时 0）
 
 // ---------------------------------------------------------------- 全局
 static Arduino_DataBus *bus = nullptr;
@@ -135,7 +136,10 @@ static bool screenOn         = true;
 static uint32_t lastActivityMs = 0;
 static bool     attLog       = false;
 static volatile float attPitch = 0, attRoll = 0;
+static float    rpWinStart = 0, rpStableRef = 0;   // 抬腕检测窗口
+static uint32_t rpTWin = 0, rpTStable = 0;
 static volatile bool  wakeRequest = false;
+static volatile bool  redrawRequest = false;
 static uint32_t lastAttPrint = 0;
 static Preferences prefs;
 
@@ -348,6 +352,10 @@ static const int TO_SEC[5] = {0, 15, 30, 60, 120};
 static void screenOff() {
     if (!screenOn) return;
     screenOn = false;
+    rpWinStart = attPitch;
+    rpStableRef = attPitch;
+    rpTWin = millis();
+    rpTStable = millis();
     if (gfx) gfx->displayOff();
     Serial.println("[SCR ] 息屏");
 }
@@ -367,6 +375,26 @@ static void screenWake(const char *why) {
 }
 
 static void markActivity() { lastActivityMs = millis(); }
+
+// ---------------------------------------------------------------- 抬腕亮屏
+// 标定结论（2026-11-22）：手臂下垂时 pitch ≈ 18-22°，抬到眼前 ≈ 76-80°，
+// 抬起过程约 1-1.5 秒。判据：1.5 秒内净上升 ≥30° + 终点 ≥55° + 之后静止 300ms。
+static void raiseTick() {
+    if (!raiseWake) return;
+    const uint32_t now = millis();
+    const float p = attPitch;
+
+    if (now - rpTWin >= 1500) { rpWinStart = p; rpTWin = now; }
+
+    // 运动检测：姿态变化超过 4° 就认为还在动
+    if (fabsf(p - rpStableRef) > 4.0f) { rpStableRef = p; rpTStable = now; }
+
+    const float rise = p - rpWinStart;
+    if (rise >= 30.0f && p >= 55.0f && (now - rpTStable) >= 300) {
+        Serial.printf("[RAISE] 抬腕触发 rise=%.1f pitch=%.1f\n", rise, p);
+        screenWake("抬腕");
+    }
+}
 
 /** 息屏状态下直接轮询触摸芯片（此时 LVGL 的 indev 不跑） */
 static bool touchWakeCheck() {
@@ -506,8 +534,7 @@ static void openSub(int i) {
         else        lv_obj_add_flag(subPages[k], LV_OBJ_FLAG_HIDDEN);
     }
     for (int k = 0; k < 3; k++) if (dots[k]) lv_obj_add_flag(dots[k], LV_OBJ_FLAG_HIDDEN);
-    lv_obj_invalidate(lv_screen_active());
-    lv_refr_now(nullptr);                 // 立刻整屏重画，避免残留像素
+    redrawRequest = true;                 // ⚠️ 不能在 LVGL 回调里 lv_refr_now（会重入）
     Serial.printf("[UI  ] 进入子页 %d\n", i);
 }
 
@@ -515,8 +542,7 @@ static void closeSub() {
     subPage = -1;
     for (int k = 0; k < 4; k++) if (subPages[k]) lv_obj_add_flag(subPages[k], LV_OBJ_FLAG_HIDDEN);
     for (int k = 0; k < 3; k++) if (dots[k]) lv_obj_remove_flag(dots[k], LV_OBJ_FLAG_HIDDEN);
-    lv_obj_invalidate(lv_screen_active());
-    lv_refr_now(nullptr);
+    redrawRequest = true;
     Serial.println("[UI  ] 返回设置列表");
 }
 static void buildUi() {
@@ -807,8 +833,7 @@ static void uiTask(void *) {
         vibrateTick();
 
         // ---- 姿态日志（进"显示"子页时开启，用于抬腕标定）
-        attLog = (subPage == 1);
-        if (attLog && millis() - lastAttPrint >= 100) {
+        if (ATT_LOG && millis() - lastAttPrint >= 100) {
             lastAttPrint = millis();
             Serial.printf("[ATT] pitch=%.1f roll=%.1f\n", attPitch, attRoll);
         }
@@ -817,14 +842,22 @@ static void uiTask(void *) {
             wakeRequest = false;
             screenWake("USB 插入");
         }
+        if (redrawRequest && screenOn) {
+            redrawRequest = false;
+            lv_obj_invalidate(lv_screen_active());
+            lv_refr_now(nullptr);
+        }
 
         // ---- 息屏状态：不跑 LVGL，只轮询触摸唤醒
         if (!screenOn) {
             if (touchWakeCheck()) {
                 screenWake("触摸");
             } else {
-                vTaskDelay(pdMS_TO_TICKS(50));
-                continue;
+                raiseTick();
+                if (!screenOn) {
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    continue;
+                }
             }
         }
 
