@@ -84,6 +84,9 @@ static volatile uint32_t uiFrames = 0;
 #define C_MINT   lv_color_hex(0x6FE3D2)   // 正常/在线
 #define C_CORAL  lv_color_hex(0xFF6B4A)   // 告警（低电/断连，本屏未用）
 
+// 中文标签字体（lv_conf 里打开了 SOURCE_HAN_SANS_SC_16_CJK）
+#define F_CJK    (&lv_font_source_han_sans_sc_16_cjk)
+
 // ---- 页面 / 触摸
 static lv_obj_t *pages[3] = {nullptr};
 static int       curPage = 0;
@@ -369,8 +372,8 @@ static lv_obj_t *mkRow(lv_obj_t *parent, int32_t y, const char *key, int idx) {
     lv_obj_set_style_bg_opa(r, 120, LV_STATE_PRESSED);
     lv_obj_set_user_data(r, (void *)(intptr_t)idx);
     lv_obj_add_event_cb(r, rowClickCb, LV_EVENT_CLICKED, nullptr);
-    mkText(r, &lv_font_montserrat_20, C_INK, 6, 18, key);
-    mkText(r, &lv_font_montserrat_20, C_DIM, 316, 18, ">");
+    mkText(r, F_CJK, C_INK, 6, 14, key);
+    mkText(r, F_CJK, C_DIM, 316, 14, ">");
     return r;
 }
 
@@ -456,14 +459,14 @@ static void buildUi() {
     {
         lv_obj_t *p = pages[2];
         addFrame(p);
-        mkText(p, &lv_font_montserrat_14, C_DIM, 34, 40, "SETTINGS");
-        mkRow(p, 92,  "DEVICE INFO", 0);
-        mkRow(p, 162, "GOAL & REST", 1);
-        mkRow(p, 232, "POWER",      2);
-        hubVal[0] = mkText(p, &lv_font_montserrat_14, C_DIM2, 250, 112, "M1b");
-        hubVal[1] = mkText(p, &lv_font_montserrat_14, C_DIM2, 250, 182, "--");
-        hubVal[2] = mkText(p, &lv_font_montserrat_14, C_DIM2, 250, 252, "--");
-        mkText(p, &lv_font_montserrat_14, C_DIM2, 34, 420, "SWIPE TO SWITCH PAGE");
+        mkText(p, F_CJK, C_DIM, 34, 36, "设置");
+        mkRow(p, 92,  "设备信息", 0);
+        mkRow(p, 162, "目标与休息", 1);
+        mkRow(p, 232, "电源", 2);
+        hubVal[0] = mkText(p, F_CJK, C_DIM2, 230, 112, "M1b");
+        hubVal[1] = mkText(p, F_CJK, C_DIM2, 220, 182, "--");
+        hubVal[2] = mkText(p, F_CJK, C_DIM2, 300, 252, "--");
+        mkText(p, F_CJK, C_DIM2, 34, 420, "左右滑动切换页面");
     }
 
     // ================= 子页 0：设备信息 =================
@@ -471,12 +474,12 @@ static void buildUi() {
     {
         lv_obj_t *p = subPages[0];
         addFrame(p);
-        mkRow(p, 24, "< SETTINGS", -1);
-        const char *keys[6] = {"POWER", "SOURCE", "RTC", "SAMPLE", "DISPLAY", "FIRMWARE"};
+        mkRow(p, 24, "< 返回", -1);
+        const char *keys[6] = {"电量", "供电", "时钟", "采样", "显示", "固件"};
         for (int i = 0; i < 6; i++) {
-            const int32_t y = 104 + i * 40;
-            mkText(p, &lv_font_montserrat_14, C_DIM, 34, y, keys[i]);
-            setVal[i] = mkText(p, &lv_font_montserrat_14, C_DIM2, 190, y, "--");
+            const int32_t y = 104 + i * 42;
+            mkText(p, F_CJK, C_DIM, 34, y, keys[i]);
+            setVal[i] = mkText(p, F_CJK, C_DIM2, 170, y, "--");
         }
     }
 
@@ -485,14 +488,14 @@ static void buildUi() {
     {
         lv_obj_t *p = subPages[1];
         addFrame(p);
-        mkRow(p, 24, "< GOAL & REST", -1);
-        mkText(p, &lv_font_montserrat_14, C_DIM, 34, 104, "DAILY GOAL");
-        lblGoalVal = mkText(p, &lv_font_montserrat_20, C_INK, 250, 98, "--");
+        mkRow(p, 24, "< 目标与休息", -1);
+        mkText(p, F_CJK, C_DIM, 34, 104, "每日目标");
+        lblGoalVal = mkText(p, &lv_font_montserrat_20, C_INK, 270, 98, "--");
         mkSlider(p, 140, 0, 2000, 20000, goalSteps);
-        mkText(p, &lv_font_montserrat_14, C_DIM, 34, 196, "REST INTERVAL");
-        lblRestVal = mkText(p, &lv_font_montserrat_20, C_INK, 250, 190, "--");
+        mkText(p, F_CJK, C_DIM, 34, 196, "组间休息");
+        lblRestVal = mkText(p, &lv_font_montserrat_20, C_INK, 270, 190, "--");
         mkSlider(p, 232, 1, 15, 180, restSec);
-        mkText(p, &lv_font_montserrat_14, C_DIM2, 34, 420, "DRAG SLIDER  /  SWIPE RIGHT = BACK");
+        mkText(p, F_CJK, C_DIM2, 34, 420, "拖动滑块 / 右滑返回");
     }
 
     // ================= 子页 2：电源 =================
@@ -500,15 +503,20 @@ static void buildUi() {
     {
         lv_obj_t *p = subPages[2];
         addFrame(p);
-        mkRow(p, 24, "< POWER", -1);
+        mkRow(p, 24, "< 电源", -1);
         lblBattDet = mkText(p, &lv_font_montserrat_20, C_INK, 34, 104, "--");
-        mkText(p, &lv_font_montserrat_14, C_DIM, 34, 160, "CAPACITY CALIBRATION");
-        lblCalVal = mkText(p, &lv_font_montserrat_20, C_INK, 250, 154, "--");
+        mkText(p, F_CJK, C_DIM, 34, 160, "容量校准");
+        lblCalVal = mkText(p, &lv_font_montserrat_20, C_INK, 270, 154, "--");
         mkSlider(p, 196, 2, 80, 120, battCal);
-        mkText(p, &lv_font_montserrat_14, C_DIM2, 34, 420, "DRAG SLIDER  /  SWIPE RIGHT = BACK");
+        mkText(p, F_CJK, C_DIM2, 34, 420, "拖动滑块 / 右滑返回");
     }
 
-    for (int i = 0; i < 3; i++) lv_obj_add_flag(subPages[i], LV_OBJ_FLAG_HIDDEN);
+    // 子页必须是不透明的，否则会透出下面的设置列表
+    for (int i = 0; i < 3; i++) {
+        lv_obj_set_style_bg_color(subPages[i], C_BG, 0);
+        lv_obj_set_style_bg_opa(subPages[i], LV_OPA_COVER, 0);
+        lv_obj_add_flag(subPages[i], LV_OBJ_FLAG_HIDDEN);
+    }
     showPage(0);
 }// ---------------------------------------------------------------- 字节序对比测量
 static void uiTask(void *) {
