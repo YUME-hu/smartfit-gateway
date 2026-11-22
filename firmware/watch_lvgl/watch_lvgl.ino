@@ -105,6 +105,14 @@ static struct { bool down; int32_t x0, y0, x1, y1; uint32_t lastMs, t0; } gTouch
 static bool     trRunning = false;
 static uint32_t trAccumMs = 0, trStartMs = 0, trStepBase = 0;
 
+// 组间休息倒计时 + 震动马达（原理图：GPIO18 -> R12 4.7K -> Q1 MMBT3904 -> 马达，马达电源来自 ALDO3）
+#define PIN_MOTOR 18
+static bool     restRunning = false;
+static uint32_t restEndMs = 0, restTotalMs = 60000;
+static lv_obj_t *lblTrCap = nullptr, *lblRestBtn = nullptr, *barRest = nullptr;
+static uint8_t  vibStep = 0;
+static uint32_t vibNextMs = 0;
+
 static void showPage(int p);
 static void handleGesture(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t durMs);
 // ---- 设置导航与参数
@@ -324,6 +332,33 @@ static void addFrame(lv_obj_t *p) {
     makeLine(p, d, 3, C_HAIR, 2);
 }
 
+static void vibrateStart() { vibStep = 1; vibNextMs = millis(); }
+
+/** 非阻塞震动：三短震（140ms 振 / 90ms 停） */
+static void vibrateTick() {
+    if (!vibStep) return;
+    if ((int32_t)(millis() - vibNextMs) < 0) return;
+    switch (vibStep) {
+        case 1: digitalWrite(PIN_MOTOR, HIGH); vibNextMs = millis() + 140; vibStep = 2; break;
+        case 2: digitalWrite(PIN_MOTOR, LOW);  vibNextMs = millis() + 90;  vibStep = 3; break;
+        case 3: digitalWrite(PIN_MOTOR, HIGH); vibNextMs = millis() + 140; vibStep = 4; break;
+        case 4: digitalWrite(PIN_MOTOR, LOW);  vibNextMs = millis() + 90;  vibStep = 5; break;
+        case 5: digitalWrite(PIN_MOTOR, HIGH); vibNextMs = millis() + 140; vibStep = 6; break;
+        default: digitalWrite(PIN_MOTOR, LOW); vibStep = 0; break;
+    }
+}
+
+static void restBtnCb(lv_event_t *) {
+    if (restRunning) {
+        restRunning = false;
+        Serial.println("[REST] 取消");
+        return;
+    }
+    restTotalMs = (uint32_t)restSec * 1000;
+    restEndMs = millis() + restTotalMs;
+    restRunning = true;
+    Serial.printf("[REST] 开始 %d 秒\n", restSec);
+}
 static void rowClickCb(lv_event_t *e) {
     lv_obj_t *r = (lv_obj_t *)lv_event_get_target(e);
     const int idx = (int)(intptr_t)lv_obj_get_user_data(r);
@@ -450,12 +485,37 @@ static void buildUi() {
     {
         lv_obj_t *p = pages[1];
         addFrame(p);
-        mkText(p, &lv_font_montserrat_14, C_DIM, 34, 40, "TRAINING / SESSION");
-        lblTrTime = mkText(p, &lv_font_montserrat_48, C_INK, 34, 96, "00:00");
-        lblTrSteps = mkText(p, &lv_font_montserrat_48, C_BLUE_HI, 34, 196, "0");
-        mkText(p, &lv_font_montserrat_20, C_DIM, 34, 256, "STEPS");
-        lblTrState = mkText(p, &lv_font_montserrat_20, C_DIM, 34, 316, "IDLE");
-        mkText(p, &lv_font_montserrat_14, C_DIM2, 34, 420, "TAP CENTER = START / STOP");
+        mkText(p, &lv_font_montserrat_14, C_DIM, 34, 40, "TRAINING");
+        lblTrCap = mkText(p, F_CJK, C_DIM, 34, 66, "本次");
+        lblTrTime = mkText(p, &lv_font_montserrat_48, C_INK, 34, 92, "00:00");
+
+        barRest = lv_bar_create(p);
+        lv_obj_set_size(barRest, 300, 6);
+        lv_obj_set_pos(barRest, 36, 154);
+        lv_bar_set_range(barRest, 0, 1000);
+        lv_bar_set_value(barRest, 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(barRest, C_HAIR, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(barRest, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(barRest, C_MINT, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(barRest, LV_OPA_COVER, LV_PART_INDICATOR);
+
+        lblTrSteps = mkText(p, &lv_font_montserrat_48, C_BLUE_HI, 34, 186, "0");
+        mkText(p, &lv_font_montserrat_20, C_DIM, 34, 246, "STEPS");
+        lblTrState = mkText(p, &lv_font_montserrat_20, C_DIM, 34, 294, "IDLE");
+
+        lv_obj_t *btn = lv_obj_create(p);
+        lv_obj_remove_style_all(btn);
+        lv_obj_set_size(btn, 250, 56);
+        lv_obj_set_pos(btn, 34, 356);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_bg_color(btn, C_HAIR, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(btn, 10, 0);
+        lv_obj_set_style_bg_color(btn, C_BLUE, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(btn, restBtnCb, LV_EVENT_CLICKED, nullptr);
+        lblRestBtn = mkText(btn, F_CJK, C_INK, 60, 16, "休息 60 秒");
+
+        mkText(p, &lv_font_montserrat_14, C_DIM2, 34, 432, "TAP CENTER = START / STOP");
     }
 
     // ================= 页 2：设置列表 =================
@@ -552,14 +612,33 @@ static void uiTask(void *) {
             if (calPct >= 0) lv_label_set_text_fmt(lblBatt, "%d%%", calPct);
             lv_obj_set_style_text_color(lblBatt, vbusIn ? C_MINT : C_DIM2, 0);
 
-            // ---- 页 1 训练
-            const uint32_t tms = trAccumMs + (trRunning ? (millis() - trStartMs) : 0);
-            lv_label_set_text_fmt(lblTrTime, "%02lu:%02lu",
-                                  (unsigned long)(tms / 60000), (unsigned long)((tms / 1000) % 60));
+            // ---- 页 1 训练（休息倒计时优先占用大数字位）
+            if (restRunning) {
+                const uint32_t now2 = millis();
+                const uint32_t left = (restEndMs > now2) ? (restEndMs - now2) : 0;
+                lv_label_set_text_fmt(lblTrTime, "%02lu:%02lu",
+                                      (unsigned long)(left / 60000), (unsigned long)((left / 1000) % 60));
+                lv_obj_set_style_text_color(lblTrTime, C_MINT, 0);
+                lv_label_set_text(lblTrCap, "休息");
+                lv_bar_set_value(barRest, (int32_t)(1000 - (left * 1000 / (restTotalMs ? restTotalMs : 1))), LV_ANIM_OFF);
+                if (left == 0) {
+                    restRunning = false;
+                    lv_bar_set_value(barRest, 0, LV_ANIM_OFF);
+                    vibrateStart();
+                    Serial.println("[REST] 结束，震动提示");
+                }
+            } else {
+                const uint32_t tms = trAccumMs + (trRunning ? (millis() - trStartMs) : 0);
+                lv_label_set_text_fmt(lblTrTime, "%02lu:%02lu",
+                                      (unsigned long)(tms / 60000), (unsigned long)((tms / 1000) % 60));
+                lv_obj_set_style_text_color(lblTrTime, C_INK, 0);
+                lv_label_set_text(lblTrCap, "本次");
+            }
             lv_label_set_text_fmt(lblTrSteps, "%lu",
                                   (unsigned long)(trRunning ? (lifetimeSteps - trStepBase) : 0));
-            lv_label_set_text(lblTrState, trRunning ? "RUNNING" : "IDLE");
-            lv_obj_set_style_text_color(lblTrState, trRunning ? C_MINT : C_DIM, 0);
+            lv_label_set_text(lblTrState, restRunning ? "RESTING" : (trRunning ? "RUNNING" : "IDLE"));
+            lv_obj_set_style_text_color(lblTrState, (restRunning || trRunning) ? C_MINT : C_DIM, 0);
+            if (lblRestBtn) lv_label_set_text_fmt(lblRestBtn, "休息 %d 秒", restSec);
 
             // ---- 页 2 设置列表
             if (hubVal[0]) lv_label_set_text(hubVal[0], "M1b");
@@ -604,6 +683,7 @@ static void uiTask(void *) {
             lv_image_set_src(whaleImg, &whale_girl_frames[wf]);
         }
 
+        vibrateTick();
         lv_timer_handler();
         vTaskDelay(pdMS_TO_TICKS(2));
     }
@@ -749,6 +829,7 @@ void setup() {
     Serial.printf("[RTC ] PCF85063 = %s%s\n", rtcOk ? "OK" : "FAIL",
                   rtcOk ? "（停振则用编译时刻初始化）" : "");
 
+
     stepCounter.configure(StepCounter::Config{});
     stepCounter.resetAll();
 
@@ -786,6 +867,16 @@ void setup() {
     xSemaphoreGive(i2cMutex);
     Wire.setClock(400000);   // DriveBus 内部可能把速率改回默认
     Serial.printf("[TOUCH] FT3168 = %s\n", touchReady ? "OK" : "FAIL");
+    // ---- 震动马达：GPIO18 经 MMBT3904 驱动，马达正极来自 ALDO3（必须在 PMU 起来之后）
+    pinMode(PIN_MOTOR, OUTPUT);
+    digitalWrite(PIN_MOTOR, LOW);
+    if (pmuReady) {
+        power.setALDO3Voltage(3300);
+        power.enableALDO3();
+        delay(20);
+    }
+    Serial.printf("[MOTOR] GPIO18 就绪，ALDO3=%s\n",
+                  (pmuReady && power.isEnableALDO3()) ? "已开" : "未确认");
     // ---- LVGL
     lv_init();
     lv_tick_set_cb(tick_cb);
