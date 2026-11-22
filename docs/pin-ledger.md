@@ -367,7 +367,6 @@ $fqbn='esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=32M,PSRAM=opi,F
    → 这条同步进 `docs/实验方案-M4a.md` §2.1：**分母按浮点或四舍五入**。
 
 ### 11.5 目录结构说明（构建相关）
-
 - `firmware/watch_lvgl/lv_conf.h`：**项目自带**的 LVGL 配置（从 `lv_conf_template.h` 派生），
   通过 `-DLV_CONF_INCLUDE_SIMPLE` 让 LVGL 优先用 sketch 目录里的这份，而不是全局的 `libraries/lv_conf.h`。
   好处：配置跟固件一起进仓库，换机器构建不会因为缺 `lv_conf.h` 失败。
@@ -380,3 +379,30 @@ $fqbn='esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=32M,PSRAM=opi,F
 ```
 
 
+
+### 11.6 重大修正：Arduino_GFX 的 `Be` 版本会字节交换 —— M0b 的 1.64×「优化」是错的
+
+**现象（2026-11-22）**：整屏颜色全错 —— 品牌蓝 #4D6BFE 显成紫、鲸鱼娘头发（深蓝）显成黄、
+皮肤（浅橙）显成蓝。看起来像"反色"，实际是 RGB565 的位被拆到别处。
+
+**定位方法（可复用，已固化为 `CAL_SCREEN` 校准图）**：
+开机先画一张校准图，同样的四色块用三种方式各画一行 ——
+`fillRect` / `draw16bitBeRGBBitmap` / `draw16bitRGBBitmap`；
+再把同一份鲸鱼位图用 BE 与 RGB 各画一张并排。**用眼睛一次就能判定**，不用猜。
+
+**结论**：
+
+| 项 | 结论 |
+| --- | --- |
+| `draw16bitBeRGBBitmap` | 会把每个 RGB565 像素做**字节交换**再送屏 → 颜色错乱 |
+| LVGL flush 应该用 | **`draw16bitRGBBitmap`** |
+| 代价 | flush 均 ~500µs → **~1030µs**（约 1.64×）；占空比仍 ~10%，25Hz 采样零丢点 |
+| ⚠️ 作废的结论 | M0b 里"BE 比 RGB 快 1.64×"—— 快是因为少做一次交换，**而那样是错的** |
+
+**素材格式随之调整**：
+- 鲸鱼娘改为 `LV_COLOR_FORMAT_RGB565` + **无 alpha、黑底预合成**（屏幕背景本就是纯黑）
+- `RGB565A8` 是否可用**未验证** —— 当时的"反色"是 BE 造成的，不能归罪于 alpha 路径
+
+**另有两条实机结论**：
+- 面板 410×502，**四边各留 34px 安全区**；四角用 L 形括号（闭合框会被圆角吃掉）
+- LVGL 内置字体无中文字形 → 表盘标签只能用英文
