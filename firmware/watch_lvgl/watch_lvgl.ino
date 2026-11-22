@@ -23,6 +23,7 @@
 #include <lvgl.h>
 #include "Arduino_GFX_Library.h"
 #include "SensorQMI8658.hpp"
+#include "SensorPCF85063.hpp"
 #include <XPowersLib.h>
 #include "../common/step_counter.h"
 #include "whale_girl.h"
@@ -42,6 +43,8 @@ static uint16_t        *buf1 = nullptr;
 static uint16_t        *buf2 = nullptr;
 
 static SensorQMI8658 qmi;
+static SensorPCF85063 rtc;
+static bool rtcOk = false;
 static StepCounter   stepCounter;
 static SemaphoreHandle_t i2cMutex = nullptr;
 static bool sensorReady = false;
@@ -64,6 +67,7 @@ static volatile bool vbusIn = true;
 // UI 对象（只在 core0 的 LVGL 任务里访问）
 static lv_obj_t *lblTime = nullptr, *lblSteps = nullptr, *lblLink = nullptr;
 static lv_obj_t *lblBatt = nullptr, *lblInfo = nullptr, *scanLine = nullptr;
+static lv_obj_t *whaleImg = nullptr;
 static lv_obj_t *segBar[5] = {nullptr};
 static volatile uint32_t uiFrames = 0;
 
@@ -225,10 +229,10 @@ static void buildUi() {
     }
 
     // ---- 鲸鱼娘
-    lv_obj_t *whale = lv_image_create(scr);
-    lv_image_set_src(whale, &whale_girl_dsc);
-    lv_obj_set_pos(whale, 262, 322);
-    lv_obj_remove_flag(whale, LV_OBJ_FLAG_CLICKABLE);
+    whaleImg = lv_image_create(scr);
+    lv_image_set_src(whaleImg, &whale_girl_frames[0]);
+    lv_obj_set_pos(whaleImg, 262, 322);
+    lv_obj_remove_flag(whaleImg, LV_OBJ_FLAG_CLICKABLE);
 
     // ---- 底部状态行
     lblLink = lv_label_create(scr);
@@ -252,8 +256,19 @@ static void uiTask(void *) {
 
             lv_label_set_text_fmt(lblSteps, "%lu", (unsigned long)lifetimeSteps);
             const uint32_t up = millis() / 1000;
-            lv_label_set_text_fmt(lblTime, "%02lu:%02lu",
-                                  (unsigned long)(up / 60), (unsigned long)(up % 60));
+            // 24 小时时钟：来自 RTC（板载无备份电源，上电若停振则已用编译时刻初始化）
+            int hh, mm;
+            if (rtcOk) {
+                xSemaphoreTake(i2cMutex, portMAX_DELAY);
+                RTC_DateTime dt = rtc.getDateTime();
+                hh = dt.getHour();
+                mm = dt.getMinute();
+                xSemaphoreGive(i2cMutex);
+            } else {
+                hh = (int)((up / 3600) % 24);
+                mm = (int)((up / 60) % 60);
+            }
+            lv_label_set_text_fmt(lblTime, "%02d:%02d", hh, mm);
 
             // 强度分段：按 目标进度 点亮
             const uint32_t pct = (lifetimeSteps * 100) / STEP_TARGET;
@@ -277,6 +292,15 @@ static void uiTask(void *) {
             lv_label_set_text_fmt(lblInfo, "loss %lu.%lu%%  flush %lums  px %luK",
                                   (unsigned long)(loss1000 / 10), (unsigned long)(loss1000 % 10),
                                   (unsigned long)(avgFlush / 1000), (unsigned long)(flushPx / 1024));
+        }
+
+        // 鲸鱼逐帧动画（8 帧 / 160ms）
+        static uint8_t wf = 0;
+        static uint32_t lastWf = 0;
+        if (whaleImg && millis() - lastWf >= 160) {
+            lastWf = millis();
+            wf = (uint8_t)((wf + 1) % WHALE_FRAMES);
+            lv_image_set_src(whaleImg, &whale_girl_frames[wf]);
         }
 
         // lv_timer_handler 必须按 16ms 节奏跑，否则帧率被这里拖死
@@ -345,8 +369,8 @@ static void drawCalibration() {
     gfx->setCursor(12, 166); gfx->print("draw16bitRGBBitmap");
 
     // ③ 两张鲸鱼并排：BE 与 RGB 各一张，直接判定图像路径是否反色
-    gfx->draw16bitBeRGBBitmap(20, 240, (uint16_t *)whale_girl_map, WHALE_W, WHALE_H);
-    gfx->draw16bitRGBBitmap(250, 240, (uint16_t *)whale_girl_map, WHALE_W, WHALE_H);
+    gfx->draw16bitBeRGBBitmap(20, 240, (uint16_t *)whale_girl_frames[0].data, WHALE_W, WHALE_H);
+    gfx->draw16bitRGBBitmap(250, 240, (uint16_t *)whale_girl_frames[0].data, WHALE_W, WHALE_H);
     gfx->setTextColor(RGB565_WHITE, RGB565_BLACK);
     gfx->setCursor(20, 228);  gfx->print("BE");
     gfx->setCursor(250, 228); gfx->print("RGB");
@@ -408,6 +432,18 @@ void setup() {
     }
     xSemaphoreGive(i2cMutex);
     Serial.printf("[IMU ] QMI8658 = %s\n", sensorReady ? "OK" : "FAIL");
+
+    // ---- RTC：板载无备份电源，一旦停振就用编译时刻初始化（M2 会改成手机对时）
+    xSemaphoreTake(i2cMutex, portMAX_DELAY);
+    rtcOk = rtc.begin(Wire, IIC_SDA, IIC_SCL);
+    if (rtcOk) {
+        const bool integrity = rtc.isClockIntegrityGuaranteed();
+        if (!rtc.isRunning()) rtc.start();
+        if (!integrity) rtc.setDateTime(RTC_DateTime(__DATE__, __TIME__));
+    }
+    xSemaphoreGive(i2cMutex);
+    Serial.printf("[RTC ] PCF85063 = %s%s\n", rtcOk ? "OK" : "FAIL",
+                  rtcOk ? "（停振则用编译时刻初始化）" : "");
 
     stepCounter.configure(StepCounter::Config{});
     stepCounter.resetAll();
