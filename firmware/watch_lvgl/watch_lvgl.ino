@@ -358,8 +358,10 @@ static void screenWake(const char *why) {
     if (gfx) {
         gfx->displayOn();
         delay(30);
+        gfx->fillScreen(RGB565_BLACK);       // 面板睡过一觉，RAM 里的内容已经丢了
     }
-    lv_obj_invalidate(lv_screen_active());   // 整屏重绘一次
+    lv_obj_invalidate(lv_screen_active());
+    lv_refr_now(nullptr);                    // 立刻强制整屏刷新，否则只重画脏区 → 出现"重影"
     lastActivityMs = millis();
     Serial.printf("[SCR ] 亮屏（%s）\n", why);
 }
