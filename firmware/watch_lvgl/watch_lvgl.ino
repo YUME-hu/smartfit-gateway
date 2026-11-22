@@ -27,6 +27,9 @@
 #include <XPowersLib.h>
 #include "../common/step_counter.h"
 #include "whale_girl.h"
+
+// 自建子集中文字体（Noto Sans SC，OFL；lv_font_conv 生成 cjk16.c）
+LV_FONT_DECLARE(cjk16);
 #include "Arduino_DriveBus_Library.h"
 #include <Preferences.h>
 
@@ -85,7 +88,7 @@ static volatile uint32_t uiFrames = 0;
 #define C_CORAL  lv_color_hex(0xFF6B4A)   // 告警（低电/断连，本屏未用）
 
 // 中文标签字体（lv_conf 里打开了 SOURCE_HAN_SANS_SC_16_CJK）
-#define F_CJK    (&lv_font_source_han_sans_sc_16_cjk)
+#define F_CJK    (&cjk16)
 
 // ---- 页面 / 触摸
 static lv_obj_t *pages[3] = {nullptr};
