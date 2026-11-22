@@ -666,7 +666,8 @@ static void buildUi() {
     }
 
     // 子页必须是不透明的，否则会透出下面的设置列表
-    for (int i = 0; i < 3; i++) {
+    // 注意：数量必须和 subPages 一样（4 个）—— 少一个就会留下一个全屏透明层挡住点击
+    for (int i = 0; i < 4; i++) {
         lv_obj_set_style_bg_color(subPages[i], C_BG, 0);
         lv_obj_set_style_bg_opa(subPages[i], LV_OPA_COVER, 0);
         lv_obj_add_flag(subPages[i], LV_OBJ_FLAG_HIDDEN);
