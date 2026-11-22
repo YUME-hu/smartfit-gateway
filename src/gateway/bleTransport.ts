@@ -19,6 +19,8 @@ export interface BleTransportOptions {
   deviceName: string
   serviceUuid: string
   charUuid: string
+  /** 下行指令特征 UUID（M2 新增；找不到就降级为只读上报） */
+  writeCharUuid?: string
   onPacket: (text: string) => void
   onStatus: (status: GatewayStatus, detail?: string) => void
   /** 上次成功连接的 deviceId，用于免扫描直连 */
@@ -146,6 +148,32 @@ function pGetCharacteristics(
   })
 }
 
+function asciiToBuffer(s: string): ArrayBuffer {
+  const buf = new ArrayBuffer(s.length)
+  const view = new Uint8Array(buf)
+  for (let i = 0; i < s.length; i++) view[i] = s.charCodeAt(i) & 0xff
+  return buf
+}
+
+function pWrite(
+  deviceId: string,
+  serviceId: string,
+  characteristicId: string,
+  data: ArrayBuffer,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    uni.writeBLECharacteristicValue({
+      deviceId,
+      serviceId,
+      characteristicId,
+      value: data,
+      success: () => resolve(),
+      fail: (e: { errMsg?: string }) =>
+        reject(new Error(e?.errMsg || 'writeBLECharacteristicValue 失败')),
+    })
+  })
+}
+
 function pNotify(deviceId: string, serviceId: string, characteristicId: string): Promise<void> {
   return new Promise((resolve, reject) => {
     uni.notifyBLECharacteristicValueChange({
@@ -181,6 +209,8 @@ function pSetMtu(deviceId: string, mtu: number): Promise<void> {
 export class UniBleTransport {
   private deviceId: string | null = null
   private charId: string | null = null
+  private writeCharId: string | null = null
+  private serviceId: string | null = null
   private stopped = true
   private connecting = false
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -274,11 +304,40 @@ export class UniBleTransport {
       this.charId = target.uuid
 
       await pNotify(deviceId, service.uuid, target.uuid)
+      this.serviceId = service.uuid
+
+      // M2：下行指令特征（可选能力 —— 老固件没有它，不能因此阻断上报）
+      const wantedWrite = normalizeUuid(
+        this.opts.writeCharUuid ?? '0000FFF2-0000-1000-8000-00805F9B34FB',
+      )
+      const w = chars.find((c) => normalizeUuid(c.uuid) === wantedWrite)
+      this.writeCharId = w ? w.uuid : null
+      if (!w) console.warn('[ble] 未找到写特征 FFF2：指令通道不可用（对时会降级）')
 
       this.reconnectAttempt = 0
       this.opts.onStatus('connected', this.opts.deviceName)
     } finally {
       this.connecting = false
+    }
+  }
+
+  /** 是否具备下行指令通道（M2 起的新固件才有） */
+  get supportsWrite(): boolean {
+    return this.writeCharId !== null && this.serviceId !== null && this.deviceId !== null
+  }
+
+  /**
+   * 发送一条文本指令。
+   * 刻意不抛异常：指令通道是**可选能力**，它失败不能中断主链路采集。
+   */
+  async writeCommand(cmd: string): Promise<boolean> {
+    if (!this.deviceId || !this.writeCharId || !this.serviceId) return false
+    try {
+      await pWrite(this.deviceId, this.serviceId, this.writeCharId, asciiToBuffer(cmd))
+      return true
+    } catch (e) {
+      console.warn('[ble] 写指令失败：' + (e instanceof Error ? e.message : String(e)))
+      return false
     }
   }
 

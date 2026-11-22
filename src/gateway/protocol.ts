@@ -22,6 +22,11 @@ export interface ParsedPacket {
   z: number
   seq: number | null
   steps: number | null
+  /**
+   * 手表侧 RTC 时间（Unix 秒）。M2 起才有，老固件不带 → null。
+   * ⚠️ 只有对过时才有意义：板载无 RTC 备份电源，断电后表内时间会跳回编译时刻。
+   */
+  deviceTs: number | null
 }
 
 /** 单轴合理上限（±4g 量程，留 3 倍余量用于识别异常包） */
@@ -55,7 +60,8 @@ export function parsePacket(raw: string): ParsedPacket | null {
   if (!text) return null
 
   const fields = text.split(',').map((f) => f.trim())
-  if (fields.length < 3 || fields.length > 5) return null
+  // 3 字段：最早固件；4/5 字段：第一阶段；6 字段：M2 起带 device_ts
+  if (fields.length < 3 || fields.length > 6) return null
 
   // 逐字段严格校验（被 MTU 截断的包通常表现为末字段为空或半截数字）
   for (const f of fields) {
@@ -84,5 +90,13 @@ export function parsePacket(raw: string): ParsedPacket | null {
     if (steps > 50) return null
   }
 
-  return { x, y, z, seq, steps }
+  let deviceTs: number | null = null
+  if (fields.length >= 6) {
+    if (!UINT_RE.test(fields[5])) return null
+    const v = Number(fields[5])
+    // 认作有效 Unix 秒的下限：2020-01-01。更小的说明是占位值（如 0），当没给
+    deviceTs = v >= 1577836800 ? v : null
+  }
+
+  return { x, y, z, seq, steps, deviceTs }
 }

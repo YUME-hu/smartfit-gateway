@@ -44,6 +44,7 @@ test('protocol: 解析 5 字段负载（含 steps）', () => {
     z: -1.11,
     seq: 3,
     steps: 7,
+    deviceTs: null,
   })
 })
 
@@ -64,7 +65,7 @@ test('protocol: 坏包与被 MTU 截断的包一律丢弃', () => {
   assert.equal(parsePacket(''), null)
   assert.equal(parsePacket('1,2'), null)
   assert.equal(parsePacket('a,2,3'), null)
-  assert.equal(parsePacket('1,2,3,4,5,6'), null, '字段数超过 5 应丢弃')
+  assert.equal(parsePacket('1,2,3,4,5,6,7'), null, '字段数超过 6 应丢弃')
   assert.equal(parsePacket('99,0,0,1'), null, '超量程')
   assert.equal(parsePacket('1,2,3,-1'), null, 'seq 非法应整包丢，不能只丢字段')
   assert.equal(parsePacket('-0.12,-0.08,-1.11,3,'), null, '末字段为空 = 被截断')
@@ -72,6 +73,23 @@ test('protocol: 坏包与被 MTU 截断的包一律丢弃', () => {
   assert.equal(parsePacket('0.1,0.2,0.3,4,999'), null, '5 秒不可能 999 步')
 })
 
+
+test('protocol: 6 字段（M2 起带 device_ts）', () => {
+  const p = parsePacket('-0.12,-0.08,-1.11,3,7,1795350621')
+  assert.equal(p.seq, 3)
+  assert.equal(p.steps, 7)
+  assert.equal(p.deviceTs, 1795350621)
+})
+
+test('protocol: device_ts 太小（占位值）当没给', () => {
+  assert.equal(parsePacket('-0.12,-0.08,-1.11,3,7,0').deviceTs, null)
+  assert.equal(parsePacket('-0.12,-0.08,-1.11,3,7,123').deviceTs, null, '2020 年之前的值视为占位')
+})
+
+test('protocol: device_ts 非整数整包丢（不能静默填 0）', () => {
+  assert.equal(parsePacket('-0.12,-0.08,-1.11,3,7,abc'), null)
+  assert.equal(parsePacket('-0.12,-0.08,-1.11,3,7,-5'), null)
+})
 test('protocol: ArrayBuffer 按 ASCII 解出', () => {
   const buf = new Uint8Array([45, 48, 46, 49]).buffer // "-0.1"
   assert.equal(bytesToAscii(buf), '-0.1')

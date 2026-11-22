@@ -56,6 +56,7 @@ static uint16_t        *buf2 = nullptr;
 static SensorQMI8658 qmi;
 static SensorPCF85063 rtc;
 static bool rtcOk = false;
+static bool rtcTrusted = false;   // RTC 时间是否可信（对过时，或上电时未停振）
 static StepCounter   stepCounter;
 static SemaphoreHandle_t i2cMutex = nullptr;
 static bool sensorReady = false;
@@ -265,11 +266,92 @@ class SrvCb : public BLEServerCallbacks {
     }
 };
 
+// ---------------------------------------------------------------- 对时
+// 指令格式（文本，便于串口/工具直接测）：T<unix_epoch_utc_seconds>
+// 固件按固定 CST+8 换算成本地时间写入 PCF85063。
+#define TZ_OFFSET_SEC (8 * 3600)
+
+// 公历 <-> epoch 的手写换算（工具链里没有 timegm，也不依赖本地时区设置）
+static int64_t daysFromCivil(int y, unsigned m, unsigned d) {
+    y -= (m <= 2);
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+static void civilFromDays(int64_t z, int &y, unsigned &m, unsigned &d) {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    y = (int)yoe + (int)(era * 400);
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    d = doy - (153 * mp + 2) / 5 + 1;
+    m = mp + (mp < 10 ? 3 : -9);
+    y += (m <= 2);
+}
+
+/** 把 RTC 里的本地时间换算成真正的 UTC epoch 秒 */
+static uint32_t rtcEpochUtc() {
+    if (!rtcOk) return 0;
+    RTC_DateTime dt = rtc.getDateTime();
+    const int64_t days = daysFromCivil(dt.getYear(), dt.getMonth(), dt.getDay());
+    int64_t secs = days * 86400 + dt.getHour() * 3600 + dt.getMinute() * 60 + dt.getSecond();
+    secs -= TZ_OFFSET_SEC;                 // RTC 存的是本地时间
+    return secs > 0 ? (uint32_t)secs : 0;
+}
+
+static void applyEpoch(uint32_t epochUtc) {
+    if (!rtcOk) { Serial.println("[RTC] 未就绪，忽略对时"); return; }
+
+    int64_t secs = (int64_t)epochUtc + TZ_OFFSET_SEC;   // 转成本地
+    int64_t days = secs / 86400;
+    int32_t rem  = (int32_t)(secs % 86400);
+    if (rem < 0) { rem += 86400; days -= 1; }
+
+    int y; unsigned mo, dd;
+    civilFromDays(days, y, mo, dd);
+    const uint8_t hh = rem / 3600;
+    const uint8_t mi = (rem % 3600) / 60;
+    const uint8_t ss = rem % 60;
+
+    xSemaphoreTake(i2cMutex, portMAX_DELAY);
+    RTC_DateTime before = rtc.getDateTime();
+    rtc.setDateTime(RTC_DateTime((uint16_t)y, (uint8_t)mo, (uint8_t)dd, hh, mi, ss));
+    RTC_DateTime after = rtc.getDateTime();
+    xSemaphoreGive(i2cMutex);
+
+    rtcTrusted = true;
+    Serial.printf("[RTC] 对时 -> %04d-%02d-%02d %02d:%02d:%02d （原 %04d-%02d-%02d %02d:%02d:%02d）\n",
+                  after.getYear(), after.getMonth(), after.getDay(),
+                  after.getHour(), after.getMinute(), after.getSecond(),
+                  before.getYear(), before.getMonth(), before.getDay(),
+                  before.getHour(), before.getMinute(), before.getSecond());
+}
 class WriteCb : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *c) override {
-        const String v = c->getValue();
-        Serial.printf("[BLE] 收到指令 (%u B): %s\n", (unsigned)v.length(), v.c_str());
+        String v = c->getValue();
+        v.trim();
+        Serial.printf("[BLE] 收到指令 (%u B): \"%s\"\n", (unsigned)v.length(), v.c_str());
         markActivity();
+        if (v.length() < 2) return;
+
+        const char cmd = v[0];
+        const uint32_t arg = (uint32_t)strtoul(v.c_str() + 1, nullptr, 10);
+        switch (cmd) {
+            case 'T':                       // 对时
+                applyEpoch(arg);
+                break;
+            case 'P':                       // ping：回一段当前状态
+                Serial.printf("[BLE] pong, uptime=%lus\n", (unsigned long)(millis() / 1000));
+                break;
+            default:
+                Serial.printf("[BLE] 未知指令 '%c'\n", cmd);
+                break;
+        }
     }
 };
 
@@ -1082,6 +1164,7 @@ void setup() {
     if (rtcOk) {
         const bool integrity = rtc.isClockIntegrityGuaranteed();
         if (!rtc.isRunning()) rtc.start();
+        rtcTrusted = integrity;                 // 未停振 → 时间仍可信
         if (!integrity) rtc.setDateTime(RTC_DateTime(__DATE__, __TIME__));
     }
     xSemaphoreGive(i2cMutex);
@@ -1213,10 +1296,24 @@ void loop() {
 
         // BLE 上报（与第一阶段同一负载格式，旧 App 无需改动）
         if (bleConnected && pNotify) {
-            char payload[72];
-            snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u",
-                     stepCounter.meanX(), stepCounter.meanY(), stepCounter.meanZ(),
-                     (unsigned)notifSent, (unsigned)ws);
+            char payload[80];
+            if (rtcTrusted) {
+                // 窗口起始时刻（读到的时刻减去窗口长度）
+                uint32_t devTs = 0;
+                if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                    devTs = rtcEpochUtc();
+                    xSemaphoreGive(i2cMutex);
+                }
+                if (devTs > (elapsed / 1000)) devTs -= (elapsed / 1000);
+                snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u,%u",
+                         stepCounter.meanX(), stepCounter.meanY(), stepCounter.meanZ(),
+                         (unsigned)notifSent, (unsigned)ws, (unsigned)devTs);
+            } else {
+                // 时间不可信就别发，让 App 按老格式处理（5 字段）
+                snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u",
+                         stepCounter.meanX(), stepCounter.meanY(), stepCounter.meanZ(),
+                         (unsigned)notifSent, (unsigned)ws);
+            }
             pNotify->setValue((uint8_t *)payload, strlen(payload));
             pNotify->notify();
             notifSent++;

@@ -25,6 +25,11 @@ export interface SampleRow {
   z: number
   /** 该 5 秒窗口内的步数（老固件为 null） */
   steps: number | null
+  /**
+   * 手表侧时间（ISO 字符串）。老固件为 null。
+   * 当前 RPC（v2）忽略这个字段；M2 的 ingest_samples_v3 才会落库。
+   */
+  device_ts?: string | null
 }
 
 export interface LatestRow {
@@ -74,6 +79,8 @@ export class SupabaseRest {
       y: s.y,
       z: s.z,
       steps: s.stepsInWindow,
+      // 老固件没有表侧时间；有则转成 ISO（v2 忽略此键，v3 才落库）
+      device_ts: s.deviceTs === null ? null : new Date(s.deviceTs * 1000).toISOString(),
     }
   }
 

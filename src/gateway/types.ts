@@ -25,6 +25,12 @@ export interface ImuSample {
   seq: number | null
   /** 该 5 秒窗口内的步数；老固件不带 steps 时为 null */
   stepsInWindow: number | null
+  /**
+   * 手表侧 RTC 时间（Unix 秒）。M2 起才有，老固件为 null。
+   * ⚠️ 板载无 RTC 备份电源：**未对过时的值不可信**（断电会跳回编译时刻）。
+   * 用途是审计/分析（与 ts 比对、SPM 对齐），**不接替 ts 作为主时间轴**。
+   */
+  deviceTs: number | null
   /** 手机接收时间（epoch ms）。手表无 RTC，用手机时钟作记录时间轴 */
   ts: number
   /** 三轴加速度，单位 g */
@@ -77,7 +83,8 @@ export const DEFAULT_CONFIG: Omit<GatewayConfig, 'supabaseUrl' | 'supabaseAnonKe
   charUuid: '0000FFF1-0000-1000-8000-00805F9B34FB',
   deviceId: 'watch-01',
   sampleTable: 'imu_samples',
-  sampleRpc: 'ingest_samples_v2',
+  // M2：v3 多了 device_ts / session_id 两列；旧 APK 仍走 v2，两者并存
+  sampleRpc: 'ingest_samples_v3',
   latestTable: 'device_latest',
   syncIntervalMs: 15 * 60 * 1000,
   batchSize: 500,

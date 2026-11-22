@@ -31,6 +31,9 @@ export function useImuGateway(config: GatewayConfig) {
   const status = ref<GatewayStatus>('idle')
   const statusDetail = ref('')
   const connected = ref(false)
+  /** M2：最近一次对时成功的时间（ms）与结果 */
+  const lastTimeSync = ref<number | null>(null)
+  const timeSyncOk = ref(false)
 
   /** 本地待上传条数 */
   const pending = ref(0)
@@ -97,6 +100,7 @@ export function useImuGateway(config: GatewayConfig) {
       status.value = s
       statusDetail.value = detail ?? ''
       connected.value = s === 'connected'
+      if (s === 'connected') void syncDeviceTime()
     },
     onPacket: (text) => {
       const parsed = parsePacket(text)
@@ -142,6 +146,23 @@ export function useImuGateway(config: GatewayConfig) {
     engine.start()
     transport.start()
     uni.onNetworkStatusChange(onNetworkChange)
+  }
+
+  /**
+   * M2：连接成功后自动对时。
+   * 板载无 RTC 备份电源 —— 手表每次上电时间都可能是错的，所以"连上就对时"是必需步骤，
+   * 而不是可选优化。指令通道（FFF2）不存在时只降级，不影响采集。
+   */
+  async function syncDeviceTime(): Promise<void> {
+    const epoch = Math.floor(Date.now() / 1000)
+    const ok = await transport.writeCommand('T' + epoch)
+    timeSyncOk.value = ok
+    if (ok) {
+      lastTimeSync.value = Date.now()
+      console.log('[gateway] 对时成功 T' + epoch)
+    } else {
+      console.warn('[gateway] 对时失败：固件可能没有 FFF2 写特征（非致命）')
+    }
   }
 
   async function stop(): Promise<void> {
@@ -195,9 +216,13 @@ export function useImuGateway(config: GatewayConfig) {
     history,
     totalSteps,
     windowSteps,
+    // M2：对时状态
+    lastTimeSync,
+    timeSyncOk,
     // 动作
     start,
     stop,
     syncNow,
+    syncDeviceTime,
   }
 }

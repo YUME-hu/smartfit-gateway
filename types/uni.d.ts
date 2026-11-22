@@ -25,6 +25,7 @@ interface UniBleApi {
   getBLEDeviceServices(options?: any): void
   getBLEDeviceCharacteristics(options?: any): void
   notifyBLECharacteristicValueChange(options?: any): void
+  writeBLECharacteristicValue(options?: any): void
   onBLECharacteristicValueChange(callback: (res: any) => void): void
   onBLEConnectionStateChange(callback: (res: any) => void): void
   setBLEMTU(options?: any): void

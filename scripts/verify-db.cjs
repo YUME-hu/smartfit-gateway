@@ -67,6 +67,8 @@ async function main() {
     'imu_samples.y',
     'imu_samples.z',
     'imu_samples.steps',
+    'imu_samples.device_ts',   // M2：手表侧时间（可空）
+    'imu_samples.session_id',  // M2：训练会话（可空，M5 才填）
     'device_latest.device_id',
     'device_latest.x',
     'device_latest.steps',
@@ -152,6 +154,25 @@ async function main() {
   const f = fn.rows[0]
   check('ingest_samples RPC 存在且 SECURITY DEFINER', !!f && f.prosecdef === true,
     f ? `owner=${f.owner}` : '函数不存在')
+
+  // 5b) M2 新增：v3 存在、SECURITY DEFINER，且无有效 token 时按 28000 拒绝
+  const fn3 = await client.query(
+    `select p.proname, p.prosecdef
+       from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public' and p.proname = 'ingest_samples_v3'`,
+  )
+  const f3 = fn3.rows[0]
+  check('ingest_samples_v3 存在且 SECURITY DEFINER', !!f3 && f3.prosecdef === true,
+    f3 ? 'ok' : '函数不存在')
+
+  let v3Rejected = false
+  try {
+    await client.query('select public.ingest_samples_v3($1,$2,$3::jsonb)',
+      ['verify-probe', 'definitely-wrong-token', JSON.stringify([sampleRow('verify-probe:v3-probe', 1)])])
+  } catch (e) {
+    v3Rejected = /28000|invalid device token/.test(String(e && e.message))
+  }
+  check('v3 无有效 token 时拒绝（28000）', v3Rejected, v3Rejected ? 'ok' : '未按预期拒绝')
 
   // 6) 幂等性：同一批重复调用应返回 0
   const keyA = `verify-probe:${Date.now()}:a`
