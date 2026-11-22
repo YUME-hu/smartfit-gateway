@@ -28,6 +28,7 @@
 #include "../common/step_counter.h"
 #include "whale_girl.h"
 #include "Arduino_DriveBus_Library.h"
+#include <Preferences.h>
 
 // ---------------------------------------------------------------- 配置
 #define SAMPLE_PERIOD_MS 40      // 25Hz
@@ -93,13 +94,42 @@ static lv_obj_t *lblTrTime = nullptr, *lblTrSteps = nullptr, *lblTrState = nullp
 static std::shared_ptr<Arduino_IIC_DriveBus> iicBus;
 static std::unique_ptr<Arduino_IIC>          touchDev;
 static bool touchReady = false;
-static struct { bool down; int32_t x0, y0, x1, y1; uint32_t lastMs; } gTouch = {false, 0, 0, 0, 0, 0};
+static struct { bool down; int32_t x0, y0, x1, y1; uint32_t lastMs, t0; } gTouch = {false, 0, 0, 0, 0, 0, 0};
 
 static bool     trRunning = false;
 static uint32_t trAccumMs = 0, trStartMs = 0, trStepBase = 0;
 
 static void showPage(int p);
-static void handleGesture(int32_t x0, int32_t y0, int32_t x1, int32_t y1);
+static void handleGesture(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t durMs);
+// ---- 设置导航与参数
+static int        subPage = -1;                 // -1 = 设置列表；0..2 = 子页
+static lv_obj_t  *subPages[3] = {nullptr};
+static lv_obj_t  *hubVal[3]   = {nullptr};
+static lv_obj_t  *lblGoalVal = nullptr, *lblRestVal = nullptr, *lblCalVal = nullptr;
+static lv_obj_t  *lblBattDet = nullptr;
+
+static int  goalSteps = 8000;
+static int  restSec   = 60;
+static int  battCal   = 100;                     // 电池百分比校准系数 80..120
+static Preferences prefs;
+
+static void openSub(int i);
+static void closeSub();
+static void rowClickCb(lv_event_t *e);
+static void sliderCb(lv_event_t *e);
+static void addFrame(lv_obj_t *p);
+static lv_obj_t *mkRow(lv_obj_t *parent, int32_t y, const char *key, int idx);
+
+/** 校准后的电量百分比：3.4V=0%，4.2V=100%，再乘系数 */
+static int battPctCalibrated() {
+    if (!pmuReady) return -1;
+    int p = (battMv - 3400) * 100 / 800;
+    if (p < 0) p = 0;
+    if (p > 100) p = 100;
+    p = p * battCal / 100;
+    if (p > 100) p = 100;
+    return p;
+}
 // ---------------------------------------------------------------- LVGL 显示
 static void disp_flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px_map) {
     const uint32_t t0 = micros();
@@ -182,11 +212,29 @@ static void showPage(int p) {
     }
 }
 
-static void handleGesture(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+static void handleGesture(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t durMs) {
     const int32_t dx = x1 - x0;
-    Serial.printf("[TOUCH] press(%ld,%ld) release(%ld,%ld) dx=%ld\n",
-                  (long)x0, (long)y0, (long)x1, (long)y1, (long)dx);
+    Serial.printf("[TOUCH] (%ld,%ld)->(%ld,%ld) dx=%ld dur=%lums page=%d sub=%d\n",
+                  (long)x0, (long)y0, (long)x1, (long)y1, (long)dx,
+                  (unsigned long)durMs, curPage, subPage);
 
+    // 长按 ≥1 秒：兜底回表盘（触摸失灵/迷路时的逃生口）
+    if (durMs >= 1000) { closeSub(); showPage(0); return; }
+
+    // 子页：右滑返回
+    if (subPage >= 0) {
+        if (dx > 50) closeSub();
+        return;
+    }
+
+    // 设置列表页：只允许滑动换页（避免和行点击打架）
+    if (curPage == 2) {
+        if (dx > 50) showPage(1);
+        else if (dx < -50) showPage(0);
+        return;
+    }
+
+    // 表盘 / 训练页：滑动或边点翻页
     if (dx > 50 || x0 < 130) { showPage(curPage - 1); return; }
     if (dx < -50 || x0 > 280) { showPage(curPage + 1); return; }
 
@@ -196,7 +244,6 @@ static void handleGesture(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
         Serial.printf("[TRN ] %s\n", trRunning ? "start" : "stop");
     }
 }
-
 // ---------------------------------------------------------------- 触摸读取
 static void touchReadCb(lv_indev_t *, lv_indev_data_t *data) {
     static uint32_t lastPoll = 0;
@@ -226,12 +273,12 @@ static void touchReadCb(lv_indev_t *, lv_indev_data_t *data) {
             pt.x = (lv_coord_t)x;
             pt.y = (lv_coord_t)y;
             gTouch.x1 = x; gTouch.y1 = y; gTouch.lastMs = millis();
-            if (!gTouch.down) { gTouch.down = true; gTouch.x0 = x; gTouch.y0 = y; }
+            if (!gTouch.down) { gTouch.down = true; gTouch.x0 = x; gTouch.y0 = y; gTouch.t0 = millis(); }
             down = true;
         } else if (gTouch.down && millis() - gTouch.lastMs > 80) {
             gTouch.down = false;
             down = false;
-            handleGesture(gTouch.x0, gTouch.y0, gTouch.x1, gTouch.y1);
+            handleGesture(gTouch.x0, gTouch.y0, gTouch.x1, gTouch.y1, millis() - gTouch.t0);
         }
     }
 
@@ -260,6 +307,90 @@ static lv_obj_t *mkText(lv_obj_t *parent, const lv_font_t *font, lv_color_t colo
     return l;
 }
 
+static void addFrame(lv_obj_t *p) {
+    static lv_point_precise_t a[] = {{34, 60}, {34, 34}, {60, 34}};
+    static lv_point_precise_t b[] = {{350, 34}, {376, 34}, {376, 60}};
+    static lv_point_precise_t c[] = {{376, 442}, {376, 468}, {350, 468}};
+    static lv_point_precise_t d[] = {{60, 468}, {34, 468}, {34, 442}};
+    makeLine(p, a, 3, C_HAIR, 2);
+    makeLine(p, b, 3, C_HAIR, 2);
+    makeLine(p, c, 3, C_HAIR, 2);
+    makeLine(p, d, 3, C_HAIR, 2);
+}
+
+static void rowClickCb(lv_event_t *e) {
+    lv_obj_t *r = (lv_obj_t *)lv_event_get_target(e);
+    const int idx = (int)(intptr_t)lv_obj_get_user_data(r);
+    if (idx < 0) { closeSub(); return; }   // -1 = 返回行
+    openSub(idx);
+}
+
+static void sliderCb(lv_event_t *e) {
+    lv_obj_t *s = (lv_obj_t *)lv_event_get_target(e);
+    const int idx = (int)(intptr_t)lv_obj_get_user_data(s);
+    const int v = (int)lv_slider_get_value(s);
+    if (idx == 0) goalSteps = v;
+    else if (idx == 1) restSec = v;
+    else battCal = v;
+
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+        prefs.putInt("goal", goalSteps);
+        prefs.putInt("rest", restSec);
+        prefs.putInt("cal", battCal);
+        Serial.printf("[SET ] goal=%d rest=%d cal=%d\n", goalSteps, restSec, battCal);
+    }
+}
+
+static lv_obj_t *mkSlider(lv_obj_t *parent, int32_t y, int idx, int vmin, int vmax, int val) {
+    lv_obj_t *s = lv_slider_create(parent);
+    lv_obj_set_size(s, 300, 8);
+    lv_obj_set_pos(s, 36, y);
+    lv_slider_set_range(s, vmin, vmax);
+    lv_slider_set_value(s, val, LV_ANIM_OFF);
+    lv_obj_set_user_data(s, (void *)(intptr_t)idx);
+    lv_obj_add_event_cb(s, sliderCb, LV_EVENT_ALL, nullptr);
+    lv_obj_set_style_bg_color(s, C_HAIR, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s, C_BLUE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s, C_BLUE_HI, LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_KNOB);
+    return s;
+}
+
+static lv_obj_t *mkRow(lv_obj_t *parent, int32_t y, const char *key, int idx) {
+    lv_obj_t *r = lv_obj_create(parent);
+    lv_obj_remove_style_all(r);
+    lv_obj_set_size(r, 342, 62);
+    lv_obj_set_pos(r, 34, y);
+    lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_color(r, C_HAIR, 0);
+    lv_obj_set_style_bg_opa(r, 0, 0);
+    lv_obj_set_style_bg_opa(r, 120, LV_STATE_PRESSED);
+    lv_obj_set_user_data(r, (void *)(intptr_t)idx);
+    lv_obj_add_event_cb(r, rowClickCb, LV_EVENT_CLICKED, nullptr);
+    mkText(r, &lv_font_montserrat_20, C_INK, 6, 18, key);
+    mkText(r, &lv_font_montserrat_20, C_DIM, 316, 18, ">");
+    return r;
+}
+
+static void openSub(int i) {
+    subPage = i;
+    for (int k = 0; k < 3; k++) {
+        if (!subPages[k]) continue;
+        if (k == i) lv_obj_remove_flag(subPages[k], LV_OBJ_FLAG_HIDDEN);
+        else        lv_obj_add_flag(subPages[k], LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int k = 0; k < 3; k++) if (dots[k]) lv_obj_add_flag(dots[k], LV_OBJ_FLAG_HIDDEN);
+    Serial.printf("[UI  ] 进入子页 %d\n", i);
+}
+
+static void closeSub() {
+    subPage = -1;
+    for (int k = 0; k < 3; k++) if (subPages[k]) lv_obj_add_flag(subPages[k], LV_OBJ_FLAG_HIDDEN);
+    for (int k = 0; k < 3; k++) if (dots[k]) lv_obj_remove_flag(dots[k], LV_OBJ_FLAG_HIDDEN);
+    Serial.println("[UI  ] 返回设置列表");
+}
 static void buildUi() {
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, C_BG, 0);
@@ -268,7 +399,7 @@ static void buildUi() {
 
     for (int i = 0; i < 3; i++) pages[i] = mkPage(scr);
 
-    // 页面指示点（放在最上层）
+    // 页面指示点
     for (int i = 0; i < 3; i++) {
         dots[i] = lv_obj_create(scr);
         lv_obj_remove_style_all(dots[i]);
@@ -280,99 +411,106 @@ static void buildUi() {
     }
 
     // ================= 页 0：表盘 =================
-    lv_obj_t *p0 = pages[0];
     {
-        static lv_point_precise_t brTL[] = {{34, 60}, {34, 34}, {60, 34}};
-        static lv_point_precise_t brTR[] = {{350, 34}, {376, 34}, {376, 60}};
-        static lv_point_precise_t brBR[] = {{376, 442}, {376, 468}, {350, 468}};
-        static lv_point_precise_t brBL[] = {{60, 468}, {34, 468}, {34, 442}};
-        makeLine(p0, brTL, 3, C_HAIR, 2);
-        makeLine(p0, brTR, 3, C_HAIR, 2);
-        makeLine(p0, brBR, 3, C_HAIR, 2);
-        makeLine(p0, brBL, 3, C_HAIR, 2);
-
+        lv_obj_t *p = pages[0];
+        addFrame(p);
         static lv_point_precise_t diamond[] = {{46, 40}, {53, 48}, {46, 56}, {39, 48}, {46, 40}};
-        makeLine(p0, diamond, 5, C_BLUE, 2);
-
-        mkText(p0, &lv_font_montserrat_14, C_DIM, 62, 36, "SMARTFIT");
-        mkText(p0, &lv_font_montserrat_14, C_DIM2, 62, 54, "NAV-0PS");
-
-        lblBatt = mkText(p0, &lv_font_montserrat_14, C_DIM2, 300, 40, "PWR --");
-
-        lblTime = mkText(p0, &lv_font_montserrat_48, C_INK, 34, 84, "00:00");
-        lblSteps = mkText(p0, &lv_font_montserrat_48, C_BLUE_HI, 34, 186, "0");
-        mkText(p0, &lv_font_montserrat_20, C_DIM, 34, 246, "STEPS");
-        mkText(p0, &lv_font_montserrat_14, C_DIM2, 120, 252, "GOAL 8000");
-
+        makeLine(p, diamond, 5, C_BLUE, 2);
+        mkText(p, &lv_font_montserrat_14, C_DIM, 62, 36, "SMARTFIT");
+        mkText(p, &lv_font_montserrat_14, C_DIM2, 62, 54, "NAV-0PS");
+        lblBatt = mkText(p, &lv_font_montserrat_14, C_DIM2, 300, 40, "--");
+        lblTime = mkText(p, &lv_font_montserrat_48, C_INK, 34, 84, "00:00");
+        lblSteps = mkText(p, &lv_font_montserrat_48, C_BLUE_HI, 34, 186, "0");
+        mkText(p, &lv_font_montserrat_20, C_DIM, 34, 246, "STEPS");
+        mkText(p, &lv_font_montserrat_14, C_DIM2, 120, 252, "GOAL --");
         static lv_point_precise_t accent[] = {{34, 282}, {88, 282}};
-        makeLine(p0, accent, 2, C_BLUE, 3);
-
+        makeLine(p, accent, 2, C_BLUE, 3);
         for (int i = 0; i < 5; i++) {
-            segBar[i] = lv_obj_create(p0);
+            segBar[i] = lv_obj_create(p);
             lv_obj_remove_style_all(segBar[i]);
             lv_obj_set_size(segBar[i], 56, 8);
             lv_obj_set_pos(segBar[i], 36 + i * 68, 296);
             lv_obj_set_style_bg_color(segBar[i], C_HAIR, 0);
             lv_obj_set_style_bg_opa(segBar[i], LV_OPA_COVER, 0);
         }
-
-        whaleImg = lv_image_create(p0);
+        whaleImg = lv_image_create(p);
         lv_image_set_src(whaleImg, &whale_girl_frames[0]);
         lv_obj_set_pos(whaleImg, 262, 322);
         lv_obj_remove_flag(whaleImg, LV_OBJ_FLAG_CLICKABLE);
-
-        lblLink = mkText(p0, &lv_font_montserrat_20, C_DIM, 34, 428, "LINK --");
+        lblLink = mkText(p, &lv_font_montserrat_20, C_DIM, 34, 428, "LINK --");
     }
 
     // ================= 页 1：训练 =================
-    lv_obj_t *p1 = pages[1];
     {
-        static lv_point_precise_t brTL[] = {{34, 60}, {34, 34}, {60, 34}};
-        static lv_point_precise_t brTR[] = {{350, 34}, {376, 34}, {376, 60}};
-        static lv_point_precise_t brBR[] = {{376, 442}, {376, 468}, {350, 468}};
-        static lv_point_precise_t brBL[] = {{60, 468}, {34, 468}, {34, 442}};
-        makeLine(p1, brTL, 3, C_HAIR, 2);
-        makeLine(p1, brTR, 3, C_HAIR, 2);
-        makeLine(p1, brBR, 3, C_HAIR, 2);
-        makeLine(p1, brBL, 3, C_HAIR, 2);
-
-        mkText(p1, &lv_font_montserrat_14, C_DIM, 34, 40, "TRAINING / SESSION");
-
-        lblTrTime = mkText(p1, &lv_font_montserrat_48, C_INK, 34, 96, "00:00");
-
-        lblTrSteps = mkText(p1, &lv_font_montserrat_48, C_BLUE_HI, 34, 196, "0");
-        mkText(p1, &lv_font_montserrat_20, C_DIM, 34, 256, "STEPS");
-
-        lblTrState = mkText(p1, &lv_font_montserrat_20, C_DIM, 34, 316, "IDLE");
-        mkText(p1, &lv_font_montserrat_14, C_DIM2, 34, 420, "TAP CENTER = START / STOP");
+        lv_obj_t *p = pages[1];
+        addFrame(p);
+        mkText(p, &lv_font_montserrat_14, C_DIM, 34, 40, "TRAINING / SESSION");
+        lblTrTime = mkText(p, &lv_font_montserrat_48, C_INK, 34, 96, "00:00");
+        lblTrSteps = mkText(p, &lv_font_montserrat_48, C_BLUE_HI, 34, 196, "0");
+        mkText(p, &lv_font_montserrat_20, C_DIM, 34, 256, "STEPS");
+        lblTrState = mkText(p, &lv_font_montserrat_20, C_DIM, 34, 316, "IDLE");
+        mkText(p, &lv_font_montserrat_14, C_DIM2, 34, 420, "TAP CENTER = START / STOP");
     }
 
-    // ================= 页 2：设置 =================
-    lv_obj_t *p2 = pages[2];
+    // ================= 页 2：设置列表 =================
     {
-        static lv_point_precise_t brTL[] = {{34, 60}, {34, 34}, {60, 34}};
-        static lv_point_precise_t brTR[] = {{350, 34}, {376, 34}, {376, 60}};
-        static lv_point_precise_t brBR[] = {{376, 442}, {376, 468}, {350, 468}};
-        static lv_point_precise_t brBL[] = {{60, 468}, {34, 468}, {34, 442}};
-        makeLine(p2, brTL, 3, C_HAIR, 2);
-        makeLine(p2, brTR, 3, C_HAIR, 2);
-        makeLine(p2, brBR, 3, C_HAIR, 2);
-        makeLine(p2, brBL, 3, C_HAIR, 2);
+        lv_obj_t *p = pages[2];
+        addFrame(p);
+        mkText(p, &lv_font_montserrat_14, C_DIM, 34, 40, "SETTINGS");
+        mkRow(p, 92,  "DEVICE INFO", 0);
+        mkRow(p, 162, "GOAL & REST", 1);
+        mkRow(p, 232, "POWER",      2);
+        hubVal[0] = mkText(p, &lv_font_montserrat_14, C_DIM2, 250, 112, "M1b");
+        hubVal[1] = mkText(p, &lv_font_montserrat_14, C_DIM2, 250, 182, "--");
+        hubVal[2] = mkText(p, &lv_font_montserrat_14, C_DIM2, 250, 252, "--");
+        mkText(p, &lv_font_montserrat_14, C_DIM2, 34, 420, "SWIPE TO SWITCH PAGE");
+    }
 
-        mkText(p2, &lv_font_montserrat_14, C_DIM, 34, 40, "SETTINGS");
-
+    // ================= 子页 0：设备信息 =================
+    subPages[0] = mkPage(scr);
+    {
+        lv_obj_t *p = subPages[0];
+        addFrame(p);
+        mkRow(p, 24, "< SETTINGS", -1);
         const char *keys[6] = {"POWER", "SOURCE", "RTC", "SAMPLE", "DISPLAY", "FIRMWARE"};
         for (int i = 0; i < 6; i++) {
-            const int32_t y = 96 + i * 40;
-            mkText(p2, &lv_font_montserrat_14, C_DIM, 34, y, keys[i]);
-            setVal[i] = mkText(p2, &lv_font_montserrat_14, C_DIM2, 200, y, "--");
+            const int32_t y = 104 + i * 40;
+            mkText(p, &lv_font_montserrat_14, C_DIM, 34, y, keys[i]);
+            setVal[i] = mkText(p, &lv_font_montserrat_14, C_DIM2, 190, y, "--");
         }
-
-        mkText(p2, &lv_font_montserrat_14, C_DIM2, 34, 420, "SWIPE OR TAP EDGE TO SWITCH");
     }
 
+    // ================= 子页 1：目标与休息 =================
+    subPages[1] = mkPage(scr);
+    {
+        lv_obj_t *p = subPages[1];
+        addFrame(p);
+        mkRow(p, 24, "< GOAL & REST", -1);
+        mkText(p, &lv_font_montserrat_14, C_DIM, 34, 104, "DAILY GOAL");
+        lblGoalVal = mkText(p, &lv_font_montserrat_20, C_INK, 250, 98, "--");
+        mkSlider(p, 140, 0, 2000, 20000, goalSteps);
+        mkText(p, &lv_font_montserrat_14, C_DIM, 34, 196, "REST INTERVAL");
+        lblRestVal = mkText(p, &lv_font_montserrat_20, C_INK, 250, 190, "--");
+        mkSlider(p, 232, 1, 15, 180, restSec);
+        mkText(p, &lv_font_montserrat_14, C_DIM2, 34, 420, "DRAG SLIDER  /  SWIPE RIGHT = BACK");
+    }
+
+    // ================= 子页 2：电源 =================
+    subPages[2] = mkPage(scr);
+    {
+        lv_obj_t *p = subPages[2];
+        addFrame(p);
+        mkRow(p, 24, "< POWER", -1);
+        lblBattDet = mkText(p, &lv_font_montserrat_20, C_INK, 34, 104, "--");
+        mkText(p, &lv_font_montserrat_14, C_DIM, 34, 160, "CAPACITY CALIBRATION");
+        lblCalVal = mkText(p, &lv_font_montserrat_20, C_INK, 250, 154, "--");
+        mkSlider(p, 196, 2, 80, 120, battCal);
+        mkText(p, &lv_font_montserrat_14, C_DIM2, 34, 420, "DRAG SLIDER  /  SWIPE RIGHT = BACK");
+    }
+
+    for (int i = 0; i < 3; i++) lv_obj_add_flag(subPages[i], LV_OBJ_FLAG_HIDDEN);
     showPage(0);
-}// ---------------------------------------------------------------- UI 任务（core0）
+}// ---------------------------------------------------------------- 字节序对比测量
 static void uiTask(void *) {
     uint32_t lastText = 0;
     static uint32_t fpsMs = 0, fpsFrames = 0;
@@ -383,7 +521,7 @@ static void uiTask(void *) {
             lastText = millis();
             const uint32_t up = millis() / 1000;
 
-            // ---- 页 0
+            // ---- 页 0 表盘
             int hh = (int)((up / 3600) % 24), mm = (int)((up / 60) % 60);
             if (rtcOk) {
                 xSemaphoreTake(i2cMutex, portMAX_DELAY);
@@ -395,17 +533,15 @@ static void uiTask(void *) {
             lv_label_set_text_fmt(lblTime, "%02d:%02d", hh, mm);
             lv_label_set_text_fmt(lblSteps, "%lu", (unsigned long)lifetimeSteps);
 
-            const uint32_t pct = (lifetimeSteps * 100) / STEP_TARGET;
+            const uint32_t pct = (lifetimeSteps * 100) / (uint32_t)(goalSteps > 0 ? goalSteps : 1);
             for (int i = 0; i < 5; i++)
                 lv_obj_set_style_bg_color(segBar[i], ((int)pct >= (i + 1) * 20) ? C_BLUE : C_HAIR, 0);
 
-            if (pmuReady) {
-                if (battPct >= 0) lv_label_set_text_fmt(lblBatt, "%d%%", (int)battPct);
-                else              lv_label_set_text_fmt(lblBatt, "%dmV", (int)battMv);
-                lv_obj_set_style_text_color(lblBatt, vbusIn ? C_MINT : C_DIM2, 0);
-            }
+            const int calPct = battPctCalibrated();
+            if (calPct >= 0) lv_label_set_text_fmt(lblBatt, "%d%%", calPct);
+            lv_obj_set_style_text_color(lblBatt, vbusIn ? C_MINT : C_DIM2, 0);
 
-            // ---- 页 1
+            // ---- 页 1 训练
             const uint32_t tms = trAccumMs + (trRunning ? (millis() - trStartMs) : 0);
             lv_label_set_text_fmt(lblTrTime, "%02lu:%02lu",
                                   (unsigned long)(tms / 60000), (unsigned long)((tms / 1000) % 60));
@@ -414,22 +550,33 @@ static void uiTask(void *) {
             lv_label_set_text(lblTrState, trRunning ? "RUNNING" : "IDLE");
             lv_obj_set_style_text_color(lblTrState, trRunning ? C_MINT : C_DIM, 0);
 
-            // ---- 页 2
-            lv_label_set_text_fmt(setVal[0], "%dmV  %d%%", (int)battMv, (int)battPct);
-            lv_label_set_text(setVal[1], vbusIn ? "USB" : "BATTERY");
-            lv_label_set_text(setVal[2], rtcOk ? "OK" : "FAIL");
+            // ---- 页 2 设置列表
+            if (hubVal[0]) lv_label_set_text(hubVal[0], "M1b");
+            if (hubVal[1]) lv_label_set_text_fmt(hubVal[1], "%d / %ds", goalSteps, restSec);
+            if (hubVal[2]) lv_label_set_text_fmt(hubVal[2], "%d%%", calPct);
+
+            // ---- 子页 0 设备信息
             const uint32_t loss1000 = totalExpected
                 ? (uint32_t)(1000.0f * (1.0f - (float)totalSamples / totalExpected)) : 0;
-            lv_label_set_text_fmt(setVal[3], "%lu.%lu%%  n=%lu",
+            const uint32_t avgFlush = flushCnt ? flushSumUs / flushCnt : 0;
+            if (setVal[0]) lv_label_set_text_fmt(setVal[0], "%dmV  %d%%", (int)battMv, calPct);
+            if (setVal[1]) lv_label_set_text(setVal[1], vbusIn ? "USB" : "BATTERY");
+            if (setVal[2]) lv_label_set_text(setVal[2], rtcOk ? "OK" : "FAIL");
+            if (setVal[3]) lv_label_set_text_fmt(setVal[3], "%lu.%lu%%  n=%lu",
                                   (unsigned long)(loss1000 / 10), (unsigned long)(loss1000 % 10),
                                   (unsigned long)totalSamples);
-            const uint32_t avgFlush = flushCnt ? flushSumUs / flushCnt : 0;
-            lv_label_set_text_fmt(setVal[4], "%d fps  %lums", (int)fpsNow,
+            if (setVal[4]) lv_label_set_text_fmt(setVal[4], "%d fps  %lums", (int)fpsNow,
                                   (unsigned long)(avgFlush / 1000));
-            lv_label_set_text(setVal[5], "M1b  LVGL 9.3");
+            if (setVal[5]) lv_label_set_text(setVal[5], "M1b  LVGL 9.3");
+
+            // ---- 子页 1 / 2
+            if (lblGoalVal) lv_label_set_text_fmt(lblGoalVal, "%d", goalSteps);
+            if (lblRestVal) lv_label_set_text_fmt(lblRestVal, "%ds", restSec);
+            if (lblCalVal)  lv_label_set_text_fmt(lblCalVal, "%d%%", battCal);
+            if (lblBattDet) lv_label_set_text_fmt(lblBattDet, "%dmV   %d%%", (int)battMv, calPct);
         }
 
-        // fps（独立于 loop 的 5 秒窗口）
+        // fps（只统计真正出帧的次数）
         if (millis() - fpsMs >= 1000) {
             const uint32_t n = uiFrames;
             fpsNow = (float)(n - fpsFrames) * 1000.0f / (float)(millis() - fpsMs);
@@ -437,10 +584,10 @@ static void uiTask(void *) {
             fpsMs = millis();
         }
 
-        // 鲸鱼逐帧动画
+        // 鲸鱼逐帧动画（只在表盘页）
         static uint8_t wf = 0;
         static uint32_t lastWf = 0;
-        if (whaleImg && millis() - lastWf >= 160) {
+        if (whaleImg && curPage == 0 && subPage < 0 && millis() - lastWf >= 160) {
             lastWf = millis();
             wf = (uint8_t)((wf + 1) % WHALE_FRAMES);
             lv_image_set_src(whaleImg, &whale_girl_frames[wf]);
@@ -450,7 +597,6 @@ static void uiTask(void *) {
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
-// ---------------------------------------------------------------- 字节序对比测量
 static void benchSwap() {
     const size_t stripPx = (size_t)LCD_WIDTH * BUF_LINES;
     uint16_t *buf = (uint16_t *)heap_caps_malloc(stripPx * 2, MALLOC_CAP_SPIRAM);
@@ -541,6 +687,12 @@ void setup() {
     Serial.printf("[LVGL] 版本 %d.%d.%d\n", lv_version_major(), lv_version_minor(), lv_version_patch());
 
     i2cMutex = xSemaphoreCreateMutex();
+
+    prefs.begin("sf", false);
+    goalSteps = prefs.getInt("goal", 8000);
+    restSec   = prefs.getInt("rest", 60);
+    battCal   = prefs.getInt("cal", 100);
+    Serial.printf("[SET ] goal=%d rest=%d cal=%d\n", goalSteps, restSec, battCal);
 
     // ---- 显示
     bus = new Arduino_ESP32QSPI(LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
