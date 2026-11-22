@@ -120,7 +120,7 @@ static void handleGesture(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32
 static int        subPage = -1;                 // -1 = 设置列表；0..2 = 子页
 static lv_obj_t  *subPages[4] = {nullptr};
 static lv_obj_t  *hubVal[4]   = {nullptr};
-static lv_obj_t  *lblToVal = nullptr, *lblBrightVal = nullptr, *lblRaiseVal = nullptr;
+static lv_obj_t  *lblToVal = nullptr, *lblBrightVal = nullptr, *lblRaiseVal = nullptr, *lblChargeVal = nullptr;
 static lv_obj_t  *lblGoalVal = nullptr, *lblRestVal = nullptr, *lblCalVal = nullptr;
 static lv_obj_t  *lblBattDet = nullptr;
 
@@ -130,10 +130,12 @@ static int  battCal   = 100;                     // 电池百分比校准系数 
 static int  screenTimeoutSec = 30;               // 0 = 不息屏
 static int  brightnessVal    = 200;              // 20..255
 static int  raiseWake        = 1;                // 抬腕亮屏开关（功能下一步接）
+static int  chargeNoSleep    = 1;                // 1 = 充电时不息屏（方便演示/调试）
 static bool screenOn         = true;
 static uint32_t lastActivityMs = 0;
 static bool     attLog       = false;
 static volatile float attPitch = 0, attRoll = 0;
+static volatile bool  wakeRequest = false;
 static uint32_t lastAttPrint = 0;
 static Preferences prefs;
 
@@ -423,10 +425,17 @@ static void rowClickCb(lv_event_t *e) {
     lv_obj_t *r = (lv_obj_t *)lv_event_get_target(e);
     const int idx = (int)(intptr_t)lv_obj_get_user_data(r);
     if (idx < 0) { closeSub(); return; }   // -1 = 返回行
-    if (idx == 100) {                      // 100 = 抬腕亮屏开关
+    if (idx == 100) {                      // 抬腕亮屏开关
         raiseWake = raiseWake ? 0 : 1;
         prefs.putInt("rw", raiseWake);
         Serial.printf("[SET ] raiseWake=%d\n", raiseWake);
+        markActivity();
+        return;
+    }
+    if (idx == 101) {                      // 充电不息屏开关
+        chargeNoSleep = chargeNoSleep ? 0 : 1;
+        prefs.putInt("cn", chargeNoSleep);
+        Serial.printf("[SET ] chargeNoSleep=%d\n", chargeNoSleep);
         markActivity();
         return;
     }
@@ -632,9 +641,11 @@ static void buildUi() {
         mkText(p, F_CJK, C_DIM, 34, 196, "亮度");
         lblBrightVal = mkText(p, F_CJK, C_INK, 240, 190, "--");
         mkSlider(p, 232, 4, 20, 255, 200);
-        mkRow(p, 300, "抬腕亮屏", 100);
-        lblRaiseVal = mkText(p, F_CJK, C_INK, 290, 318, "--");
-        mkText(p, F_CJK, C_DIM2, 34, 420, "拖动滑块 / 右滑返回");
+        mkRow(p, 292, "抬腕亮屏", 100);
+        lblRaiseVal = mkText(p, F_CJK, C_INK, 290, 310, "--");
+        mkRow(p, 356, "充电不息屏", 101);
+        lblChargeVal = mkText(p, F_CJK, C_INK, 290, 374, "--");
+        mkText(p, F_CJK, C_DIM2, 34, 432, "拖动滑块 / 右滑返回");
     }
 
     // ================= 子页 2：目标与休息 =================
@@ -761,6 +772,7 @@ static void uiTask(void *) {
             if (lblToVal)     lv_label_set_text(lblToVal, screenTimeoutSec ? (screenTimeoutSec == 15 ? "15 秒" : screenTimeoutSec == 30 ? "30 秒" : screenTimeoutSec == 60 ? "1 分钟" : "2 分钟") : "关闭");
             if (lblBrightVal) lv_label_set_text_fmt(lblBrightVal, "%d", brightnessVal);
             if (lblRaiseVal)  lv_label_set_text(lblRaiseVal, raiseWake ? "开" : "关");
+            if (lblChargeVal) lv_label_set_text(lblChargeVal, chargeNoSleep ? "否" : "是");
             if (hubVal[1])    lv_label_set_text(hubVal[1], screenTimeoutSec ? (screenTimeoutSec == 15 ? "15s" : screenTimeoutSec == 30 ? "30s" : screenTimeoutSec == 60 ? "1min" : "2min") : "OFF");
         }
 
@@ -790,6 +802,11 @@ static void uiTask(void *) {
             Serial.printf("[ATT] pitch=%.1f roll=%.1f\n", attPitch, attRoll);
         }
 
+        if (wakeRequest) {
+            wakeRequest = false;
+            screenWake("USB 插入");
+        }
+
         // ---- 息屏状态：不跑 LVGL，只轮询触摸唤醒
         if (!screenOn) {
             if (touchWakeCheck()) {
@@ -801,7 +818,9 @@ static void uiTask(void *) {
         }
 
         // ---- 空闲超时息屏（充电时不息屏，方便演示）
-        if (screenTimeoutSec > 0 && !vbusIn && millis() - lastActivityMs > (uint32_t)screenTimeoutSec * 1000) {
+        const bool allowSleep = (chargeNoSleep == 0) || !vbusIn;
+        if (screenTimeoutSec > 0 && allowSleep &&
+            millis() - lastActivityMs > (uint32_t)screenTimeoutSec * 1000) {
             screenOff();
             continue;
         }
@@ -908,6 +927,7 @@ void setup() {
     screenTimeoutSec = prefs.getInt("to", 30);
     brightnessVal    = prefs.getInt("br", 200);
     raiseWake        = prefs.getInt("rw", 1);
+    chargeNoSleep    = prefs.getInt("cn", 1);
     Serial.printf("[SET ] goal=%d rest=%d cal=%d\n", goalSteps, restSec, battCal);
 
     // ---- 显示
@@ -1056,8 +1076,12 @@ void loop() {
         xSemaphoreTake(i2cMutex, portMAX_DELAY);
         battMv = power.getBattVoltage();
         battPct = power.getBatteryPercent();
+        const bool wasVbus = vbusIn;
         vbusIn = power.isVbusIn();
         xSemaphoreGive(i2cMutex);
+
+        // 插上 USB 就亮屏（安全网：息屏后迷路时插线即可恢复）
+        if (vbusIn && !wasVbus && !screenOn) wakeRequest = true;
     }
 
     if (now - winStart >= WINDOW_MS) {
