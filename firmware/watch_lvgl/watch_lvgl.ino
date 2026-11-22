@@ -31,6 +31,10 @@
 // 自建子集中文字体（Noto Sans SC，OFL；lv_font_conv 生成 cjk16.c）
 LV_FONT_DECLARE(cjk16);
 #include "Arduino_DriveBus_Library.h"
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 #include <Preferences.h>
 
 // ---------------------------------------------------------------- 配置
@@ -237,6 +241,67 @@ static lv_obj_t *makeLine(lv_obj_t *parent, lv_point_precise_t *pts, uint16_t n,
 
 
 
+// ---------------------------------------------------------------- BLE（M2 第一步：先把上报找回来）
+#define SERVICE_UUID      "0000FFF0-0000-1000-8000-00805F9B34FB"
+#define CHAR_NOTIFY_UUID  "0000FFF1-0000-1000-8000-00805F9B34FB"
+#define CHAR_WRITE_UUID   "0000FFF2-0000-1000-8000-00805F9B34FB"   // M2 新增：下行指令
+
+static BLEServer         *pServer  = nullptr;
+static BLECharacteristic *pNotify  = nullptr;
+static BLECharacteristic *pWrite   = nullptr;
+static volatile bool      bleConnected = false;
+static uint32_t           notifSent = 0;
+
+class SrvCb : public BLEServerCallbacks {
+    void onConnect(BLEServer *) override {
+        bleConnected = true;
+        markActivity();
+        Serial.println("[BLE] 主机已连接");
+    }
+    void onDisconnect(BLEServer *s) override {
+        bleConnected = false;
+        Serial.println("[BLE] 断开，重新广播");
+        s->startAdvertising();
+    }
+};
+
+class WriteCb : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *c) override {
+        const String v = c->getValue();
+        Serial.printf("[BLE] 收到指令 (%u B): %s\n", (unsigned)v.length(), v.c_str());
+        markActivity();
+    }
+};
+
+static void initBle() {
+    BLEDevice::init("ESP32_Fitness_Watch");
+    BLEDevice::setMTU(185);
+
+    pServer = BLEDevice::createServer();
+    if (!pServer) { Serial.println("[BLE] createServer 失败"); return; }
+    pServer->setCallbacks(new SrvCb());
+
+    BLEService *svc = pServer->createService(SERVICE_UUID);
+
+    pNotify = svc->createCharacteristic(CHAR_NOTIFY_UUID,
+                    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+    pNotify->addDescriptor(new BLE2902());
+    pNotify->setValue("0.00,0.00,0.00");
+
+    pWrite = svc->createCharacteristic(CHAR_WRITE_UUID,
+                    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+    pWrite->setCallbacks(new WriteCb());
+
+    svc->start();
+
+    BLEAdvertising *adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(SERVICE_UUID);
+    adv->setScanResponse(true);
+    adv->setMinPreferred(0x06);
+    adv->setMinPreferred(0x12);
+    BLEDevice::startAdvertising();
+    Serial.println("[BLE] 广播中：ESP32_Fitness_Watch（FFF1 上报 / FFF2 指令）");
+}
 // ---------------------------------------------------------------- 页面切换
 static void showPage(int p) {
     if (p < 0) p = 2;
@@ -749,6 +814,10 @@ static void uiTask(void *) {
                 lv_obj_set_style_bg_color(segBar[i], ((int)pct >= (i + 1) * 20) ? C_BLUE : C_HAIR, 0);
 
             const int calPct = battPctCalibrated();
+            if (lblLink) {
+                lv_label_set_text(lblLink, bleConnected ? "LINK BLE" : "LINK --");
+                lv_obj_set_style_text_color(lblLink, bleConnected ? C_MINT : C_DIM, 0);
+            }
             if (calPct >= 0) lv_label_set_text_fmt(lblBatt, "%d%%", calPct);
             lv_obj_set_style_text_color(lblBatt, vbusIn ? C_MINT : C_DIM2, 0);
 
@@ -1101,6 +1170,8 @@ void setup() {
         Serial.println("[TOUCH] 输入设备已挂到 LVGL");
     }
 
+    initBle();
+
     xTaskCreatePinnedToCore(samplerTask, "sampler", 4096, nullptr, 5, nullptr, 1);
     xTaskCreatePinnedToCore(uiTask, "ui", 8192, nullptr, 3, nullptr, 0);
 
@@ -1139,6 +1210,18 @@ void loop() {
         totalExpected += expected;
 
         const uint32_t ws = stepCounter.windowSteps();
+
+        // BLE 上报（与第一阶段同一负载格式，旧 App 无需改动）
+        if (bleConnected && pNotify) {
+            char payload[72];
+            snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u",
+                     stepCounter.meanX(), stepCounter.meanY(), stepCounter.meanZ(),
+                     (unsigned)notifSent, (unsigned)ws);
+            pNotify->setValue((uint8_t *)payload, strlen(payload));
+            pNotify->notify();
+            notifSent++;
+        }
+
         stepCounter.resetWindow();
 
         const uint32_t avgFlush = flushCnt ? flushSumUs / flushCnt : 0;
