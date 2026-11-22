@@ -43,6 +43,7 @@ LV_FONT_DECLARE(cjk16);
 // ---------------------------------------------------------------- 全局
 static Arduino_DataBus *bus = nullptr;
 static Arduino_GFX     *gfx = nullptr;
+static Arduino_CO5300  *panel = nullptr;   // 具体类型：setBrightness 只在子类里
 static lv_display_t    *disp = nullptr;
 static uint16_t        *buf1 = nullptr;
 static uint16_t        *buf2 = nullptr;
@@ -117,14 +118,23 @@ static void showPage(int p);
 static void handleGesture(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t durMs);
 // ---- 设置导航与参数
 static int        subPage = -1;                 // -1 = 设置列表；0..2 = 子页
-static lv_obj_t  *subPages[3] = {nullptr};
-static lv_obj_t  *hubVal[3]   = {nullptr};
+static lv_obj_t  *subPages[4] = {nullptr};
+static lv_obj_t  *hubVal[4]   = {nullptr};
+static lv_obj_t  *lblToVal = nullptr, *lblBrightVal = nullptr, *lblRaiseVal = nullptr;
 static lv_obj_t  *lblGoalVal = nullptr, *lblRestVal = nullptr, *lblCalVal = nullptr;
 static lv_obj_t  *lblBattDet = nullptr;
 
 static int  goalSteps = 8000;
 static int  restSec   = 60;
 static int  battCal   = 100;                     // 电池百分比校准系数 80..120
+static int  screenTimeoutSec = 30;               // 0 = 不息屏
+static int  brightnessVal    = 200;              // 20..255
+static int  raiseWake        = 1;                // 抬腕亮屏开关（功能下一步接）
+static bool screenOn         = true;
+static uint32_t lastActivityMs = 0;
+static bool     attLog       = false;
+static volatile float attPitch = 0, attRoll = 0;
+static uint32_t lastAttPrint = 0;
 static Preferences prefs;
 
 static void openSub(int i);
@@ -193,6 +203,14 @@ static void samplerTask(void *) {
             winSamples++;
             totalSamples++;
             if (stepCounter.feed(x, y, z, millis())) lifetimeSteps++;
+
+            // 姿态（低通后算俯仰/横滚），给抬腕检测用
+            static float lx = 0, ly = 0, lz = 0;
+            lx += (x - lx) * 0.15f;
+            ly += (y - ly) * 0.15f;
+            lz += (z - lz) * 0.15f;
+            attPitch = atan2f(-ly, sqrtf(lx * lx + lz * lz)) * 57.29578f;
+            attRoll  = atan2f(lx, lz) * 57.29578f;
         }
     }
 }
@@ -228,6 +246,7 @@ static void showPage(int p) {
 
 static void handleGesture(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t durMs) {
     const int32_t dx = x1 - x0;
+    markActivity();
     Serial.printf("[TOUCH] (%ld,%ld)->(%ld,%ld) dx=%ld dur=%lums page=%d sub=%d\n",
                   (long)x0, (long)y0, (long)x1, (long)y1, (long)dx,
                   (unsigned long)durMs, curPage, subPage);
@@ -321,6 +340,47 @@ static lv_obj_t *mkText(lv_obj_t *parent, const lv_font_t *font, lv_color_t colo
     return l;
 }
 
+// ---------------------------------------------------------------- 息屏与唤醒
+static const int TO_SEC[5] = {0, 15, 30, 60, 120};
+
+static void screenOff() {
+    if (!screenOn) return;
+    screenOn = false;
+    if (gfx) gfx->displayOff();
+    Serial.println("[SCR ] 息屏");
+}
+
+static void screenWake(const char *why) {
+    if (screenOn) return;
+    screenOn = true;
+    if (gfx) {
+        gfx->displayOn();
+        delay(30);
+    }
+    lv_obj_invalidate(lv_screen_active());   // 整屏重绘一次
+    lastActivityMs = millis();
+    Serial.printf("[SCR ] 亮屏（%s）\n", why);
+}
+
+static void markActivity() { lastActivityMs = millis(); }
+
+/** 息屏状态下直接轮询触摸芯片（此时 LVGL 的 indev 不跑） */
+static bool touchWakeCheck() {
+    if (screenOn || !touchDev) return false;
+    bool hit = false;
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        if (touchDev->IIC_Interrupt_Flag) {
+            touchDev->IIC_Interrupt_Flag = false;
+            int32_t x = touchDev->IIC_Read_Device_Value(
+                            touchDev->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+            int32_t y = touchDev->IIC_Read_Device_Value(
+                            touchDev->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+            if (x >= 0 && y >= 0 && x < LCD_WIDTH && y < LCD_HEIGHT) hit = true;
+        }
+        xSemaphoreGive(i2cMutex);
+    }
+    return hit;
+}
 static void addFrame(lv_obj_t *p) {
     static lv_point_precise_t a[] = {{34, 60}, {34, 34}, {60, 34}};
     static lv_point_precise_t b[] = {{350, 34}, {376, 34}, {376, 60}};
@@ -363,6 +423,13 @@ static void rowClickCb(lv_event_t *e) {
     lv_obj_t *r = (lv_obj_t *)lv_event_get_target(e);
     const int idx = (int)(intptr_t)lv_obj_get_user_data(r);
     if (idx < 0) { closeSub(); return; }   // -1 = 返回行
+    if (idx == 100) {                      // 100 = 抬腕亮屏开关
+        raiseWake = raiseWake ? 0 : 1;
+        prefs.putInt("rw", raiseWake);
+        Serial.printf("[SET ] raiseWake=%d\n", raiseWake);
+        markActivity();
+        return;
+    }
     openSub(idx);
 }
 
@@ -372,13 +439,18 @@ static void sliderCb(lv_event_t *e) {
     const int v = (int)lv_slider_get_value(s);
     if (idx == 0) goalSteps = v;
     else if (idx == 1) restSec = v;
-    else battCal = v;
+    else if (idx == 2) battCal = v;
+    else if (idx == 3) screenTimeoutSec = TO_SEC[v < 0 ? 0 : (v > 4 ? 4 : v)];
+    else if (idx == 4) { brightnessVal = v; if (panel) panel->setBrightness((uint8_t)v); }
 
     if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
         prefs.putInt("goal", goalSteps);
         prefs.putInt("rest", restSec);
         prefs.putInt("cal", battCal);
-        Serial.printf("[SET ] goal=%d rest=%d cal=%d\n", goalSteps, restSec, battCal);
+        prefs.putInt("to", screenTimeoutSec);
+        prefs.putInt("br", brightnessVal);
+        Serial.printf("[SET ] goal=%d rest=%d cal=%d to=%d br=%d\n",
+                      goalSteps, restSec, battCal, screenTimeoutSec, brightnessVal);
     }
 }
 
@@ -417,7 +489,7 @@ static lv_obj_t *mkRow(lv_obj_t *parent, int32_t y, const char *key, int idx) {
 
 static void openSub(int i) {
     subPage = i;
-    for (int k = 0; k < 3; k++) {
+    for (int k = 0; k < 4; k++) {
         if (!subPages[k]) continue;
         if (k == i) lv_obj_remove_flag(subPages[k], LV_OBJ_FLAG_HIDDEN);
         else        lv_obj_add_flag(subPages[k], LV_OBJ_FLAG_HIDDEN);
@@ -428,7 +500,7 @@ static void openSub(int i) {
 
 static void closeSub() {
     subPage = -1;
-    for (int k = 0; k < 3; k++) if (subPages[k]) lv_obj_add_flag(subPages[k], LV_OBJ_FLAG_HIDDEN);
+    for (int k = 0; k < 4; k++) if (subPages[k]) lv_obj_add_flag(subPages[k], LV_OBJ_FLAG_HIDDEN);
     for (int k = 0; k < 3; k++) if (dots[k]) lv_obj_remove_flag(dots[k], LV_OBJ_FLAG_HIDDEN);
     Serial.println("[UI  ] 返回设置列表");
 }
@@ -523,12 +595,14 @@ static void buildUi() {
         lv_obj_t *p = pages[2];
         addFrame(p);
         mkText(p, F_CJK, C_DIM, 34, 36, "设置");
-        mkRow(p, 92,  "设备信息", 0);
-        mkRow(p, 162, "目标与休息", 1);
-        mkRow(p, 232, "电源", 2);
-        hubVal[0] = mkText(p, F_CJK, C_DIM2, 230, 112, "M1b");
-        hubVal[1] = mkText(p, F_CJK, C_DIM2, 220, 182, "--");
-        hubVal[2] = mkText(p, F_CJK, C_DIM2, 300, 252, "--");
+        mkRow(p, 82,  "设备信息", 0);
+        mkRow(p, 148, "显示", 1);
+        mkRow(p, 214, "目标与休息", 2);
+        mkRow(p, 280, "电源", 3);
+        hubVal[0] = mkText(p, F_CJK, C_DIM2, 230, 100, "M1b");
+        hubVal[1] = mkText(p, F_CJK, C_DIM2, 250, 166, "--");
+        hubVal[2] = mkText(p, F_CJK, C_DIM2, 200, 232, "--");
+        hubVal[3] = mkText(p, F_CJK, C_DIM2, 290, 298, "--");
         mkText(p, F_CJK, C_DIM2, 34, 420, "左右滑动切换页面");
     }
 
@@ -546,8 +620,25 @@ static void buildUi() {
         }
     }
 
-    // ================= 子页 1：目标与休息 =================
+    // ================= 子页 1：显示 =================
     subPages[1] = mkPage(scr);
+    {
+        lv_obj_t *p = subPages[1];
+        addFrame(p);
+        mkRow(p, 24, "< 显示", -1);
+        mkText(p, F_CJK, C_DIM, 34, 104, "熄屏时间");
+        lblToVal = mkText(p, F_CJK, C_INK, 240, 98, "--");
+        mkSlider(p, 140, 3, 0, 4, 2);
+        mkText(p, F_CJK, C_DIM, 34, 196, "亮度");
+        lblBrightVal = mkText(p, F_CJK, C_INK, 240, 190, "--");
+        mkSlider(p, 232, 4, 20, 255, 200);
+        mkRow(p, 300, "抬腕亮屏", 100);
+        lblRaiseVal = mkText(p, F_CJK, C_INK, 290, 318, "--");
+        mkText(p, F_CJK, C_DIM2, 34, 420, "拖动滑块 / 右滑返回");
+    }
+
+    // ================= 子页 2：目标与休息 =================
+    subPages[2] = mkPage(scr);
     {
         lv_obj_t *p = subPages[1];
         addFrame(p);
@@ -561,8 +652,8 @@ static void buildUi() {
         mkText(p, F_CJK, C_DIM2, 34, 420, "拖动滑块 / 右滑返回");
     }
 
-    // ================= 子页 2：电源 =================
-    subPages[2] = mkPage(scr);
+    // ================= 子页 3：电源 =================
+    subPages[3] = mkPage(scr);
     {
         lv_obj_t *p = subPages[2];
         addFrame(p);
@@ -664,6 +755,12 @@ static void uiTask(void *) {
             if (lblRestVal) lv_label_set_text_fmt(lblRestVal, "%ds", restSec);
             if (lblCalVal)  lv_label_set_text_fmt(lblCalVal, "%d%%", battCal);
             if (lblBattDet) lv_label_set_text_fmt(lblBattDet, "%dmV   %d%%", (int)battMv, calPct);
+
+            // ---- 显示子页
+            if (lblToVal)     lv_label_set_text(lblToVal, screenTimeoutSec ? (screenTimeoutSec == 15 ? "15 秒" : screenTimeoutSec == 30 ? "30 秒" : screenTimeoutSec == 60 ? "1 分钟" : "2 分钟") : "关闭");
+            if (lblBrightVal) lv_label_set_text_fmt(lblBrightVal, "%d", brightnessVal);
+            if (lblRaiseVal)  lv_label_set_text(lblRaiseVal, raiseWake ? "开" : "关");
+            if (hubVal[1])    lv_label_set_text(hubVal[1], screenTimeoutSec ? (screenTimeoutSec == 15 ? "15s" : screenTimeoutSec == 30 ? "30s" : screenTimeoutSec == 60 ? "1min" : "2min") : "OFF");
         }
 
         // fps（只统计真正出帧的次数）
@@ -684,6 +781,30 @@ static void uiTask(void *) {
         }
 
         vibrateTick();
+
+        // ---- 姿态日志（进"显示"子页时开启，用于抬腕标定）
+        attLog = (subPage == 1);
+        if (attLog && millis() - lastAttPrint >= 100) {
+            lastAttPrint = millis();
+            Serial.printf("[ATT] pitch=%.1f roll=%.1f\n", attPitch, attRoll);
+        }
+
+        // ---- 息屏状态：不跑 LVGL，只轮询触摸唤醒
+        if (!screenOn) {
+            if (touchWakeCheck()) {
+                screenWake("触摸");
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+        }
+
+        // ---- 空闲超时息屏（充电时不息屏，方便演示）
+        if (screenTimeoutSec > 0 && !vbusIn && millis() - lastActivityMs > (uint32_t)screenTimeoutSec * 1000) {
+            screenOff();
+            continue;
+        }
+
         lv_timer_handler();
         vTaskDelay(pdMS_TO_TICKS(2));
     }
@@ -783,11 +904,15 @@ void setup() {
     goalSteps = prefs.getInt("goal", 8000);
     restSec   = prefs.getInt("rest", 60);
     battCal   = prefs.getInt("cal", 100);
+    screenTimeoutSec = prefs.getInt("to", 30);
+    brightnessVal    = prefs.getInt("br", 200);
+    raiseWake        = prefs.getInt("rw", 1);
     Serial.printf("[SET ] goal=%d rest=%d cal=%d\n", goalSteps, restSec, battCal);
 
     // ---- 显示
     bus = new Arduino_ESP32QSPI(LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
-    gfx = new Arduino_CO5300(bus, LCD_RESET, 0, LCD_WIDTH, LCD_HEIGHT, 22, 0, 0, 0);
+    panel = new Arduino_CO5300(bus, LCD_RESET, 0, LCD_WIDTH, LCD_HEIGHT, 22, 0, 0, 0);
+    gfx = panel;
     if (!gfx->begin()) {
         Serial.println("[DISP] gfx->begin() 失败");
     } else {
@@ -875,6 +1000,8 @@ void setup() {
         power.enableALDO3();
         delay(20);
     }
+    if (panel) panel->setBrightness((uint8_t)brightnessVal);
+    lastActivityMs = millis();
     Serial.printf("[MOTOR] GPIO18 就绪，ALDO3=%s\n",
                   (pmuReady && power.isEnableALDO3()) ? "已开" : "未确认");
     // ---- LVGL
