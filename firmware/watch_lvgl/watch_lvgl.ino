@@ -127,6 +127,7 @@ static int        subPage = -1;                 // -1 = 设置列表；0..2 = �
 static lv_obj_t  *subPages[4] = {nullptr};
 static lv_obj_t  *hubVal[4]   = {nullptr};
 static lv_obj_t  *lblToVal = nullptr, *lblBrightVal = nullptr, *lblRaiseVal = nullptr, *lblChargeVal = nullptr;
+static lv_obj_t  *valBuf = nullptr;
 static lv_obj_t  *lblGoalVal = nullptr, *lblRestVal = nullptr, *lblCalVal = nullptr;
 static lv_obj_t  *lblBattDet = nullptr;
 
@@ -251,11 +252,13 @@ static BLEServer         *pServer  = nullptr;
 static BLECharacteristic *pNotify  = nullptr;
 static BLECharacteristic *pWrite   = nullptr;
 static volatile bool      bleConnected = false;
+static uint32_t           bleConnectedAt = 0;   // 连接时刻：重放要等手机订阅完成
 static uint32_t           notifSent = 0;
 
 class SrvCb : public BLEServerCallbacks {
     void onConnect(BLEServer *) override {
         bleConnected = true;
+        bleConnectedAt = millis();
         markActivity();
         Serial.println("[BLE] 主机已连接");
     }
@@ -266,6 +269,105 @@ class SrvCb : public BLEServerCallbacks {
     }
 };
 
+// ---------------------------------------------------------------- M2.5 窗口环形缓冲
+// 目标：手机不在身边时窗口不丢，重连后按原顺序重放（App 靠 client_key 幂等去重）。
+// 记录 16 字节：seq u32 / device_ts u32 / x,y,z int16(milli-g) / steps u8 / pad u8
+// 17280 个窗口 = 24 小时，占 PSRAM 约 270KB。
+#define RING_WINDOWS    17280
+#define RING_REC_BYTES  16
+
+static uint8_t *ringBuf = nullptr;
+static uint32_t ringHead = 0;      // 最旧待发
+static uint32_t ringCount = 0;
+static uint32_t ringDropped = 0;   // 缓冲满被丢掉的窗口数
+static uint32_t winSeq = 0;        // 窗口序号（在**采集时**分配，重放保持不变）
+static uint32_t lastDrainMs = 0;
+
+static inline uint8_t *ringSlot(uint32_t idx) {
+    return ringBuf + (idx % RING_WINDOWS) * RING_REC_BYTES;
+}
+
+static void ringInit() {
+    ringBuf = (uint8_t *)heap_caps_malloc((size_t)RING_WINDOWS * RING_REC_BYTES, MALLOC_CAP_SPIRAM);
+    if (!ringBuf) {
+        Serial.println("[RING] PSRAM 分配失败，退化为不缓存（断连会丢）");
+        return;
+    }
+    ringHead = ringCount = 0;
+    Serial.printf("[RING] %u 个窗口（约 24h），占用 %u KB PSRAM\n",
+                  (unsigned)RING_WINDOWS,
+                  (unsigned)((size_t)RING_WINDOWS * RING_REC_BYTES / 1024));
+}
+
+static void ringPush(uint32_t ts, float mx, float my, float mz, uint32_t steps) {
+    if (!ringBuf) return;
+
+    const uint32_t seq = ++winSeq;
+
+    if (ringCount >= RING_WINDOWS) {           // 满 → 丢最旧并计数
+        ringHead = (ringHead + 1) % RING_WINDOWS;
+        ringCount--;
+        ringDropped++;
+    }
+
+    uint8_t *p = ringSlot(ringHead + ringCount);
+    p[0] = (uint8_t)(seq & 0xFF); p[1] = (uint8_t)((seq >> 8) & 0xFF);
+    p[2] = (uint8_t)((seq >> 16) & 0xFF); p[3] = (uint8_t)((seq >> 24) & 0xFF);
+    p[4] = (uint8_t)(ts & 0xFF); p[5] = (uint8_t)((ts >> 8) & 0xFF);
+    p[6] = (uint8_t)((ts >> 16) & 0xFF); p[7] = (uint8_t)((ts >> 24) & 0xFF);
+
+    const int16_t ix = (int16_t)lroundf(mx * 1000.0f);
+    const int16_t iy = (int16_t)lroundf(my * 1000.0f);
+    const int16_t iz = (int16_t)lroundf(mz * 1000.0f);
+    p[8]  = (uint8_t)(ix & 0xFF);  p[9]  = (uint8_t)((ix >> 8) & 0xFF);
+    p[10] = (uint8_t)(iy & 0xFF);  p[11] = (uint8_t)((iy >> 8) & 0xFF);
+    p[12] = (uint8_t)(iz & 0xFF);  p[13] = (uint8_t)((iz >> 8) & 0xFF);
+
+    p[14] = (uint8_t)(steps > 255 ? 255 : steps);
+    p[15] = 0;
+    ringCount++;
+}
+
+static uint32_t rdU32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static int16_t rdI16(const uint8_t *p) {
+    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+/** 把待发窗口推给 BLE；每次最多 4 条，避免长时间占住 loop */
+static void ringDrain() {
+    if (!ringBuf || !bleConnected || !pNotify || ringCount == 0) return;
+    // 连接后先等 3 秒：手机（尤其 Windows/部分安卓）要做服务发现 + 订阅 CCCD，
+    // 期间发的包会打到空气里。M3 会换成"App 主动发 RESUME 指令"的握手，不再靠猜时间。
+    if (millis() - bleConnectedAt < 3000) return;
+    if (millis() - lastDrainMs < 20) return;
+    lastDrainMs = millis();
+
+    for (int k = 0; k < 2 && ringCount > 0; k++) {
+        const uint8_t *p = ringSlot(ringHead);
+        const uint32_t seq = rdU32(p);
+        const uint32_t ts  = rdU32(p + 4);
+        const float mx = rdI16(p + 8)  / 1000.0f;
+        const float my = rdI16(p + 10) / 1000.0f;
+        const float mz = rdI16(p + 12) / 1000.0f;
+        const uint32_t steps = p[14];
+
+        char payload[80];
+        if (ts != 0) {
+            snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u,%u",
+                     mx, my, mz, (unsigned)seq, (unsigned)steps, (unsigned)ts);
+        } else {
+            snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u",
+                     mx, my, mz, (unsigned)seq, (unsigned)steps);
+        }
+        pNotify->setValue((uint8_t *)payload, strlen(payload));
+        pNotify->notify();
+
+        ringHead = (ringHead + 1) % RING_WINDOWS;
+        ringCount--;
+    }
+}
 // ---------------------------------------------------------------- 对时
 // 指令格式（文本，便于串口/工具直接测）：T<unix_epoch_utc_seconds>
 // 固件按固定 CST+8 换算成本地时间写入 PCF85063。
@@ -806,6 +908,9 @@ static void buildUi() {
             mkText(p, F_CJK, C_DIM, 34, y, keys[i]);
             setVal[i] = mkText(p, F_CJK, C_DIM2, 170, y, "--");
         }
+        // M2.5：断连缓存状态（待发窗口数 / 因满丢弃数）
+        mkText(p, F_CJK, C_DIM, 34, 356, "缓存");
+        valBuf = mkText(p, F_CJK, C_DIM2, 170, 356, "--");
     }
 
     // ================= 子页 1：显示 =================
@@ -948,7 +1053,9 @@ static void uiTask(void *) {
                                   (unsigned long)totalSamples);
             if (setVal[4]) lv_label_set_text_fmt(setVal[4], "%d fps  %lums", (int)fpsNow,
                                   (unsigned long)(avgFlush / 1000));
-            if (setVal[5]) lv_label_set_text(setVal[5], "M1b  LVGL 9.3");
+            if (setVal[5]) lv_label_set_text(setVal[5], "M2  LVGL 9.3");
+            if (valBuf) lv_label_set_text_fmt(valBuf, "%u / 丢 %u",
+                                              (unsigned)ringCount, (unsigned)ringDropped);
 
             // ---- 子页 1 / 2
             if (lblGoalVal) lv_label_set_text_fmt(lblGoalVal, "%d", goalSteps);
@@ -1253,6 +1360,7 @@ void setup() {
         Serial.println("[TOUCH] 输入设备已挂到 LVGL");
     }
 
+    ringInit();
     initBle();
 
     xTaskCreatePinnedToCore(samplerTask, "sampler", 4096, nullptr, 5, nullptr, 1);
@@ -1294,30 +1402,17 @@ void loop() {
 
         const uint32_t ws = stepCounter.windowSteps();
 
-        // BLE 上报（与第一阶段同一负载格式，旧 App 无需改动）
-        if (bleConnected && pNotify) {
-            char payload[80];
-            if (rtcTrusted) {
-                // 窗口起始时刻（读到的时刻减去窗口长度）
-                uint32_t devTs = 0;
-                if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                    devTs = rtcEpochUtc();
-                    xSemaphoreGive(i2cMutex);
-                }
-                if (devTs > (elapsed / 1000)) devTs -= (elapsed / 1000);
-                snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u,%u",
-                         stepCounter.meanX(), stepCounter.meanY(), stepCounter.meanZ(),
-                         (unsigned)notifSent, (unsigned)ws, (unsigned)devTs);
-            } else {
-                // 时间不可信就别发，让 App 按老格式处理（5 字段）
-                snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u",
-                         stepCounter.meanX(), stepCounter.meanY(), stepCounter.meanZ(),
-                         (unsigned)notifSent, (unsigned)ws);
+        // M2.5：窗口一律先入环形缓冲（连没连上都入），再由 ringDrain 按顺序推出去。
+        // 这样断连期间的数据不会丢，重连后从最旧的重放，App 靠 client_key 幂等去重。
+        uint32_t devTs = 0;
+        if (rtcTrusted) {
+            if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                devTs = rtcEpochUtc();
+                xSemaphoreGive(i2cMutex);
             }
-            pNotify->setValue((uint8_t *)payload, strlen(payload));
-            pNotify->notify();
-            notifSent++;
+            if (devTs > (elapsed / 1000)) devTs -= (elapsed / 1000);
         }
+        ringPush(devTs, stepCounter.meanX(), stepCounter.meanY(), stepCounter.meanZ(), ws);
 
         stepCounter.resetWindow();
 
@@ -1332,6 +1427,8 @@ void loop() {
 
         flushCnt = 0; flushSumUs = 0; flushMaxUs = 0; flushPx = 0;
     }
+
+    ringDrain();
 
     delay(20);
 }
