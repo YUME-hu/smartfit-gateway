@@ -256,6 +256,14 @@ static volatile bool      bleConnected = false;
 static uint32_t           bleConnectedAt = 0;   // 连接时刻：重放要等手机订阅完成
 static volatile bool      protoV2 = false;      // App 发过 "V2" 才切二进制帧（旧 App 保持文本）
 static volatile bool      helloPending = false; // HELLO 帧待发（不在 BLE 写回调里直接 notify）
+
+// 停等重传状态（提前声明：SrvCb 断连时要清）
+static bool     inflight = false;
+static uint32_t inflightAt = 0;
+static uint8_t  inflightTries = 0;
+static volatile uint16_t ackSeqRecv = 0;
+static volatile bool     ackPending = false;
+static uint32_t rtRetransmit = 0, rtGiveUp = 0, rtAcked = 0;
 static uint32_t           notifSent = 0;
 
 class SrvCb : public BLEServerCallbacks {
@@ -267,6 +275,8 @@ class SrvCb : public BLEServerCallbacks {
     }
     void onDisconnect(BLEServer *s) override {
         bleConnected = false;
+        inflight = false;
+        inflightTries = 0;
         Serial.println("[BLE] 断开，重新广播");
         s->startAdvertising();
     }
@@ -296,6 +306,7 @@ static void ringInit() {
         Serial.println("[RING] PSRAM 分配失败，退化为不缓存（断连会丢）");
         return;
     }
+    memset(ringBuf, 0, (size_t)RING_WINDOWS * RING_REC_BYTES);
     ringHead = ringCount = 0;
     Serial.printf("[RING] %u 个窗口（约 24h），占用 %u KB PSRAM\n",
                   (unsigned)RING_WINDOWS,
@@ -338,45 +349,100 @@ static int16_t rdI16(const uint8_t *p) {
     return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-/** 把待发窗口推给 BLE；每次最多 4 条，避免长时间占住 loop */
+// ---------------------------------------------------------------- 发送与 ACK 重传
+// v2 用"一帧在途 + 等 ACK"的停等协议：
+//   发出后 1.5s 没等到 ACK 就重发同一 seq（内容完全相同，App 侧按 client_key 幂等去重），
+//   重试 3 次仍无 ACK 才放弃并计一次 giveup。
+// 文本模式没有 ACK 通道，保持"发完即出队"的旧行为。
+
+static inline uint32_t rdHeadSeq() {
+    return ringBuf ? rdU32(ringSlot(ringHead)) : 0;
+}
+
+static inline void ringPopHead() {
+    if (ringCount == 0) {                 // 下溢保护：uint32 掉到 0xFFFFFFFF 会读整个空环
+        Serial.println("[RING] 保护：空环出队被忽略");
+        inflight = false;
+        return;
+    }
+    ringHead = (ringHead + 1) % RING_WINDOWS;
+    ringCount--;
+    if (ringCount == 0) inflight = false;
+}
+
+/** 推一个窗口出去；v2 走停等 + 重传，文本走发完即出队 */
 static void ringDrain() {
     if (!ringBuf || !bleConnected || !pNotify || ringCount == 0) return;
-    // 连接后先等 3 秒：手机（尤其 Windows/部分安卓）要做服务发现 + 订阅 CCCD，
-    // 期间发的包会打到空气里。M3 会换成"App 主动发 RESUME 指令"的握手，不再靠猜时间。
+    // 连接后先等 3 秒：手机要做服务发现 + 订阅 CCCD，期间发的包会打到空气里。
     if (millis() - bleConnectedAt < 3000) return;
     if (millis() - lastDrainMs < 20) return;
     lastDrainMs = millis();
 
-    for (int k = 0; k < 2 && ringCount > 0; k++) {
-        const uint8_t *p = ringSlot(ringHead);
-        const uint32_t seq = rdU32(p);
-        const uint32_t ts  = rdU32(p + 4);
-        const float mx = rdI16(p + 8)  / 1000.0f;
-        const float my = rdI16(p + 10) / 1000.0f;
-        const float mz = rdI16(p + 12) / 1000.0f;
-        const uint32_t steps = p[14];
-
-        if (protoV2) {
-            uint8_t frame[FFRAME_SIZE];
-            fframe_encode_data(frame, (uint16_t)(seq & 0xFFFF), ts, mx, my, mz, (uint8_t)steps);
-            pNotify->setValue(frame, FFRAME_SIZE);
-        } else {
-            char payload[80];
-            if (ts != 0) {
-                snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u,%u",
-                         mx, my, mz, (unsigned)seq, (unsigned)steps, (unsigned)ts);
-            } else {
-                snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u",
-                         mx, my, mz, (unsigned)seq, (unsigned)steps);
-            }
-            pNotify->setValue((uint8_t *)payload, strlen(payload));
+    // 先消费 ACK（只认队首那一帧的确认）
+    if (ackPending) {
+        ackPending = false;
+        if (inflight && (uint16_t)(rdHeadSeq() & 0xFFFFu) == ackSeqRecv) {
+            ringPopHead();
+            inflight = false;
+            inflightTries = 0;
+            rtAcked++;
+            // ⚠️ 本函数开头的 ringCount==0 检查是在处理 ACK **之前**做的。
+            // 这里弹完可能已经空了，必须重新判，否则会把一个从未写入的空槽当数据发出去。
+            if (ringCount == 0) return;
         }
-        pNotify->notify();
+    }
 
-        ringHead = (ringHead + 1) % RING_WINDOWS;
-        ringCount--;
+    if (inflight) {
+        if (millis() - inflightAt < 1500) return;      // 还在等 ACK
+        if (inflightTries >= 3) {                      // 放弃这一帧
+            rtGiveUp++;
+            ringPopHead();
+            inflight = false;
+            inflightTries = 0;
+            Serial.println("[RT  ] 3 次无 ACK，放弃该帧");
+            return;
+        }
+        rtRetransmit++;
+        Serial.printf("[RT  ] 重传 seq=%u（第 %u 次）\n",
+                      (unsigned)(rdHeadSeq() & 0xFFFFu), (unsigned)(inflightTries + 1));
+    }
+
+    const uint8_t *p = ringSlot(ringHead);
+    const uint32_t seq = rdU32(p);
+    const uint32_t ts  = rdU32(p + 4);
+    const float mx = rdI16(p + 8)  / 1000.0f;
+    const float my = rdI16(p + 10) / 1000.0f;
+    const float mz = rdI16(p + 12) / 1000.0f;
+    const uint32_t steps = p[14];
+
+    if (protoV2) {
+        uint8_t frame[FFRAME_SIZE];
+        fframe_encode_data(frame, (uint16_t)(seq & 0xFFFF), ts, mx, my, mz, (uint8_t)steps);
+        pNotify->setValue(frame, FFRAME_SIZE);
+    } else {
+        char payload[80];
+        if (ts != 0) {
+            snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u,%u",
+                     mx, my, mz, (unsigned)seq, (unsigned)steps, (unsigned)ts);
+        } else {
+            snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u",
+                     mx, my, mz, (unsigned)seq, (unsigned)steps);
+        }
+        pNotify->setValue((uint8_t *)payload, strlen(payload));
+    }
+    pNotify->notify();
+
+    inflight = true;
+    inflightAt = millis();
+    inflightTries++;
+
+    if (!protoV2) {                                    // 文本模式：无 ACK 可等
+        ringPopHead();
+        inflight = false;
+        inflightTries = 0;
     }
 }
+
 // ---------------------------------------------------------------- 对时
 // 指令格式（文本，便于串口/工具直接测）：T<unix_epoch_utc_seconds>
 // 固件按固定 CST+8 换算成本地时间写入 PCF85063。
@@ -444,6 +510,17 @@ static void applyEpoch(uint32_t epochUtc) {
 }
 class WriteCb : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *c) override {
+        // 二进制帧（v2 的 ACK）优先：整 18 字节 + magic 匹配才当帧处理
+        const uint8_t *raw = c->getData();
+        const size_t len = c->getLength();
+        if (len == FFRAME_SIZE && raw && raw[0] == FFRAME_MAGIC) {
+            if (fframe_valid(raw, len) && raw[2] == FFRAME_TYPE_ACK) {
+                ackSeqRecv = fframe_get_u16(raw, 3);
+                ackPending = true;
+            }
+            return;
+        }
+
         String v = c->getValue();
         v.trim();
         Serial.printf("[BLE] 收到指令 (%u B): \"%s\"\n", (unsigned)v.length(), v.c_str());
