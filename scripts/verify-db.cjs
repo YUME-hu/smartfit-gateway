@@ -145,15 +145,15 @@ async function main() {
   const pubTables = pub.rows.map((r) => r.tablename)
   check('device_latest 已加入 supabase_realtime', pubTables.includes('device_latest'), pubTables.join(', ') || '(空)')
 
-  // 5) RPC 存在且为 SECURITY DEFINER
-  const fn = await client.query(
-    `select p.proname, p.prosecdef, pg_get_userbyid(p.proowner) as owner
+  // 5) T1.1：旧的两版写入 RPC 必须已删除（否则无 token 也能写库）
+  const dropped = await client.query(
+    `select p.proname
        from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-      where n.nspname = 'public' and p.proname = 'ingest_samples'`,
+      where n.nspname = 'public' and p.proname in ('ingest_samples', 'ingest_samples_v2')`,
   )
-  const f = fn.rows[0]
-  check('ingest_samples RPC 存在且 SECURITY DEFINER', !!f && f.prosecdef === true,
-    f ? `owner=${f.owner}` : '函数不存在')
+  const stillThere = dropped.rows.map((r) => r.proname)
+  check('T1.1：ingest_samples / v2 已删除（只留 v3）', stillThere.length === 0,
+    stillThere.length ? '仍存在: ' + stillThere.join(', ') : 'ok')
 
   // 5b) M2 新增：v3 存在、SECURITY DEFINER，且无有效 token 时按 28000 拒绝
   const fn3 = await client.query(
@@ -175,18 +175,29 @@ async function main() {
   check('v3 无有效 token 时拒绝（28000）', v3Rejected, v3Rejected ? 'ok' : '未按预期拒绝')
 
   // 6) 幂等性：同一批重复调用应返回 0
-  const keyA = `verify-probe:${Date.now()}:a`
-  const batch = JSON.stringify([sampleRow(keyA, 5)])
-  const r1 = await client.query('select public.ingest_samples($1::jsonb) as n', [batch])
-  check('RPC 首次写入 1 行', r1.rows[0].n === 1, `返回 ${r1.rows[0].n}`)
+  //    T1.1 之后 v1/v2 已删，所有写入都必须带 token —— 这里临时签发一个探测用 token
+  const PROBE_TOKEN = 'verify-db-probe-token'
+  await client.query(
+    `insert into public.device_tokens (device_id, token_hash, label)
+     values ('verify-probe', encode(digest($1, 'sha256'), 'hex'), 'verify-db 探测临时 token')
+     on conflict (device_id, token_hash) do nothing`,
+    [PROBE_TOKEN],
+  )
 
-  const r2 = await client.query('select public.ingest_samples($1::jsonb) as n', [batch])
-  check('RPC 重复写入返回 0（幂等）', r2.rows[0].n === 0, `返回 ${r2.rows[0].n}`)
+  const callV3 = (rows) =>
+    client.query('select public.ingest_samples_v3($1,$2,$3::jsonb) as n',
+      ['verify-probe', PROBE_TOKEN, JSON.stringify(rows)])
+
+  const keyA = `verify-probe:${Date.now()}:a`
+  const r1 = await callV3([sampleRow(keyA, 5)])
+  check('v3 首次写入 1 行', r1.rows[0].n === 1, `返回 ${r1.rows[0].n}`)
+
+  const r2 = await callV3([sampleRow(keyA, 5)])
+  check('v3 重复写入返回 0（幂等）', r2.rows[0].n === 0, `返回 ${r2.rows[0].n}`)
 
   // 7) 混合批次：一条重复 + 一条新，应只写入新的那条（这是纯 INSERT 做不到的）
   const keyB = `verify-probe:${Date.now()}:b`
-  const mixed = JSON.stringify([sampleRow(keyA, 5), sampleRow(keyB, 9)])
-  const r3 = await client.query('select public.ingest_samples($1::jsonb) as n', [mixed])
+  const r3 = await callV3([sampleRow(keyA, 5), sampleRow(keyB, 9)])
   check('混合批次只写入新行（重复的跳过）', r3.rows[0].n === 1, `返回 ${r3.rows[0].n}`)
 
   // 8) reps 表（Web 端深蹲识别写入）
@@ -361,6 +372,10 @@ async function main() {
   const del4 = await client.query(`delete from public.reps where device_id = 'verify-probe-pet'`)
   const del5 = await client.query(`delete from public.imu_samples where device_id = 'verify-probe-pet'`)
   const del6 = await client.query(`delete from public.pet_state where device_id = 'verify-probe-pet'`)
+  // T1.1：探测用的临时 token 也要收掉，否则库里会留下一把"能写 verify-probe 的钥匙"
+  const delTok = await client.query(
+    `delete from public.device_tokens where label = 'verify-db 探测临时 token'`,
+  )
 
   // 清理源数据后必须对账，否则 pet_state 会留下增量残值
   // （这是计数器表的通病：源表删了，累计量不会自己回退）
