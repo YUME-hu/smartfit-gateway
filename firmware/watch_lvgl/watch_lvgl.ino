@@ -718,6 +718,27 @@ static void screenWake(const char *why) {
 
 static void markActivity() { lastActivityMs = millis(); }
 
+// ---------------------------------------------------------------- 电量日志（放电实验）
+// 断 USB 后没法往串口打日志，所以把 mV 写进 NVS：电池耗尽重启后仍能读出整条曲线。
+// 5 分钟一条；低于 10% 改 1 分钟一条，为了抓到末尾那段陡降。
+static String   blogCache;
+static uint32_t lastBlogMs = 0;
+
+static void blogTick() {
+    const uint32_t now = millis();
+    uint32_t period = 5UL * 60UL * 1000UL;
+    if (battPct >= 0 && battPct <= 10) period = 60UL * 1000UL;
+    if (now - lastBlogMs < period) return;
+    lastBlogMs = now;
+
+    if (blogCache.length() > 3000) blogCache = "";     // 防止 NVS 字符串无限增长
+
+    char line[20];
+    snprintf(line, sizeof(line), "%u:%d,", (unsigned)(now / 60000UL), (int)battMv);
+    blogCache += line;
+    prefs.putString("blog", blogCache);
+    Serial.printf("[BLOG] %s\n", line);                // 插着 USB 时也能看到
+}
 // ---------------------------------------------------------------- 抬腕亮屏
 // 标定结论（2026-11-22）：手臂下垂时 pitch ≈ 18-22°，抬到眼前 ≈ 76-80°，
 // 抬起过程约 1-1.5 秒。判据：1.5 秒内净上升 ≥30° + 终点 ≥55° + 之后静止 300ms。
@@ -1454,6 +1475,11 @@ void setup() {
         Serial.println("[TOUCH] 输入设备已挂到 LVGL");
     }
 
+    blogCache = prefs.getString("blog");
+    if (blogCache.length() > 0) {
+        Serial.printf("[BLOG] 上次运行的电量记录（%u 字节）：\n%s\n", (unsigned)blogCache.length(), blogCache.c_str());
+    }
+
     ringInit();
     initBle();
 
@@ -1482,6 +1508,8 @@ void loop() {
 
         // 插上 USB 就亮屏（安全网：息屏后迷路时插线即可恢复）
         if (vbusIn && !wasVbus && !screenOn) wakeRequest = true;
+
+        blogTick();
     }
 
     if (now - winStart >= WINDOW_MS) {
@@ -1511,10 +1539,11 @@ void loop() {
         stepCounter.resetWindow();
 
         const uint32_t avgFlush = flushCnt ? flushSumUs / flushCnt : 0;
-        Serial.printf("[WIN] 采样=%lu/%lu 丢点=%.2f%% 步=%lu | flush avg=%luus max=%luus 次=%lu px=%luK | ui帧=%lu\n",
+        Serial.printf("[WIN] 采样=%lu/%lu 丢点=%.2f%% 步=%lu | %dmV %d%% | flush avg=%luus max=%luus 次=%lu px=%luK | ui帧=%lu\n",
                       (unsigned long)got, (unsigned long)expected,
                       expected ? (100.0f * (1.0f - (float)got / expected)) : 0.0f,
                       (unsigned long)ws,
+                      (int)battMv, (int)battPct,
                       (unsigned long)avgFlush, (unsigned long)flushMaxUs,
                       (unsigned long)flushCnt, (unsigned long)(flushPx / 1024),
                       (unsigned long)uiFrames);
