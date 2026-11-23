@@ -179,7 +179,7 @@ async function main() {
   const PROBE_TOKEN = 'verify-db-probe-token'
   await client.query(
     `insert into public.device_tokens (device_id, token_hash, label)
-     values ('verify-probe', encode(digest($1, 'sha256'), 'hex'), 'verify-db 探测临时 token')
+     values ('verify-probe', encode(extensions.digest($1, 'sha256'), 'hex'), 'verify-db 探测临时 token')
      on conflict (device_id, token_hash) do nothing`,
     [PROBE_TOKEN],
   )
