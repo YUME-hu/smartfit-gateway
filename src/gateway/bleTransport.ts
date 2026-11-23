@@ -22,6 +22,8 @@ export interface BleTransportOptions {
   /** 下行指令特征 UUID（M2 新增；找不到就降级为只读上报） */
   writeCharUuid?: string
   onPacket: (text: string) => void
+  /** 收到二进制帧（协议 v2）。与 onPacket 二选一触发，由首字节 magic 判定 */
+  onFrame?: (bytes: Uint8Array) => void
   onStatus: (status: GatewayStatus, detail?: string) => void
   /** 上次成功连接的 deviceId，用于免扫描直连 */
   lastDeviceId?: string
@@ -341,6 +343,22 @@ export class UniBleTransport {
     }
   }
 
+  /** 发送二进制数据（协议 v2 的 ACK 帧） */
+  async writeBytes(data: Uint8Array): Promise<boolean> {
+    if (!this.deviceId || !this.writeCharId || !this.serviceId) return false
+    try {
+      const buf = data.buffer.slice(
+        data.byteOffset,
+        data.byteOffset + data.byteLength,
+      ) as ArrayBuffer
+      await pWrite(this.deviceId, this.serviceId, this.writeCharId, buf)
+      return true
+    } catch (e) {
+      console.warn('[ble] 写二进制失败：' + (e instanceof Error ? e.message : String(e)))
+      return false
+    }
+  }
+
   /**
    * 拿到一个已连接的 deviceId。
    * 先试上次的 deviceId（iOS 重扫很慢，且后台扫描常被限制），失败再扫描。
@@ -422,7 +440,13 @@ export class UniBleTransport {
     }) => {
       if (res.deviceId !== this.deviceId) return
       if (this.charId && normalizeUuid(res.characteristicId) !== normalizeUuid(this.charId)) return
-      this.opts.onPacket(bytesToAscii(res.value))
+      const bytes = new Uint8Array(res.value)
+      // 0xA7 是帧 magic，文本协议里不会出现 —— 用它区分两种格式，不需要额外握手状态
+      if (bytes.length === 18 && bytes[0] === 0xa7 && this.opts.onFrame) {
+        this.opts.onFrame(bytes)
+      } else {
+        this.opts.onPacket(bytesToAscii(res.value))
+      }
     })
 
     uni.onBLEConnectionStateChange((res: { deviceId: string; connected: boolean }) => {

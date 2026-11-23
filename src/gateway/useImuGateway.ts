@@ -20,6 +20,7 @@ import { SyncEngine } from './syncEngine'
 import { LatestPublisher } from './latest'
 import { UniBleTransport } from './bleTransport'
 import { parsePacket } from './protocol'
+import { decodeFrame, encodeAck } from './frame'
 import { uniStore } from './storage'
 import type { GatewayConfig, GatewayStatus, ImuSample } from './types'
 
@@ -34,6 +35,8 @@ export function useImuGateway(config: GatewayConfig) {
   /** M2：最近一次对时成功的时间（ms）与结果 */
   const lastTimeSync = ref<number | null>(null)
   const timeSyncOk = ref(false)
+  /** 手表报了 HELLO 才认为走 v2；否则一直用文本解析（自动降级） */
+  const protoVersion = ref(0)
 
   /** 本地待上传条数 */
   const pending = ref(0)
@@ -100,7 +103,11 @@ export function useImuGateway(config: GatewayConfig) {
       status.value = s
       statusDetail.value = detail ?? ''
       connected.value = s === 'connected'
-      if (s === 'connected') void syncDeviceTime()
+      if (s === 'connected') {
+        void syncDeviceTime()
+        // 声明支持 v2；老固件会忽略它并继续发文本，App 侧靠 magic 自动降级
+        void transport.writeCommand('V2')
+      }
     },
     onPacket: (text) => {
       const parsed = parsePacket(text)
@@ -131,6 +138,51 @@ export function useImuGateway(config: GatewayConfig) {
 
       // 实时看板：写 device_latest，让 Web 端用 Realtime 收到
       latest.publish(sample)
+    },
+    onFrame: (bytes) => {
+      const f = decodeFrame(bytes)
+      if (!f) {
+        // CRC 失败/长度不对：只计数，绝不抛异常打断采集
+        badPackets.value++
+        return
+      }
+      if (f.type === 'hello') {
+        protoVersion.value = f.protoVer
+        console.log(`[gateway] 手表协议 v${f.protoVer}，固件 ${f.fwMajor}.${f.fwMinor}`)
+        return
+      }
+      if (f.type !== 'data') return
+
+      // 二进制帧 → 复用文本协议的样本管线（幂等键、缓存、落库完全一致）
+      const sample = session.attribute(
+        {
+          x: f.x,
+          y: f.y,
+          z: f.z,
+          seq: f.seq,
+          steps: f.steps,
+          deviceTs: f.deviceTs > 0 ? f.deviceTs : null,
+        },
+        Date.now(),
+      )
+      cache.append(sample)
+      packets.value++
+      lostPackets.value += session.lastGap
+      pending.value = cache.pending
+      dropped.value = cache.dropped
+      lastSample.value = sample
+      history.value.push(sample)
+      if (history.value.length > HISTORY_MAX) {
+        history.value.splice(0, history.value.length - HISTORY_MAX)
+      }
+      if (sample.stepsInWindow !== null) {
+        windowSteps.value = sample.stepsInWindow
+        totalSteps.value += sample.stepsInWindow
+      }
+      latest.publish(sample)
+
+      // 回 ACK：让固件知道这一帧真的到了（M3 的重传依据）
+      void transport.writeBytes(encodeAck(f.seq))
     },
   })
 
@@ -219,6 +271,7 @@ export function useImuGateway(config: GatewayConfig) {
     // M2：对时状态
     lastTimeSync,
     timeSyncOk,
+    protoVersion,
     // 动作
     start,
     stop,

@@ -31,6 +31,7 @@
 // 自建子集中文字体（Noto Sans SC，OFL；lv_font_conv 生成 cjk16.c）
 LV_FONT_DECLARE(cjk16);
 #include "Arduino_DriveBus_Library.h"
+#include "frame.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -253,6 +254,8 @@ static BLECharacteristic *pNotify  = nullptr;
 static BLECharacteristic *pWrite   = nullptr;
 static volatile bool      bleConnected = false;
 static uint32_t           bleConnectedAt = 0;   // 连接时刻：重放要等手机订阅完成
+static volatile bool      protoV2 = false;      // App 发过 "V2" 才切二进制帧（旧 App 保持文本）
+static volatile bool      helloPending = false; // HELLO 帧待发（不在 BLE 写回调里直接 notify）
 static uint32_t           notifSent = 0;
 
 class SrvCb : public BLEServerCallbacks {
@@ -353,15 +356,21 @@ static void ringDrain() {
         const float mz = rdI16(p + 12) / 1000.0f;
         const uint32_t steps = p[14];
 
-        char payload[80];
-        if (ts != 0) {
-            snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u,%u",
-                     mx, my, mz, (unsigned)seq, (unsigned)steps, (unsigned)ts);
+        if (protoV2) {
+            uint8_t frame[FFRAME_SIZE];
+            fframe_encode_data(frame, (uint16_t)(seq & 0xFFFF), ts, mx, my, mz, (uint8_t)steps);
+            pNotify->setValue(frame, FFRAME_SIZE);
         } else {
-            snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u",
-                     mx, my, mz, (unsigned)seq, (unsigned)steps);
+            char payload[80];
+            if (ts != 0) {
+                snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u,%u",
+                         mx, my, mz, (unsigned)seq, (unsigned)steps, (unsigned)ts);
+            } else {
+                snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%u,%u",
+                         mx, my, mz, (unsigned)seq, (unsigned)steps);
+            }
+            pNotify->setValue((uint8_t *)payload, strlen(payload));
         }
-        pNotify->setValue((uint8_t *)payload, strlen(payload));
         pNotify->notify();
 
         ringHead = (ringHead + 1) % RING_WINDOWS;
@@ -446,6 +455,13 @@ class WriteCb : public BLECharacteristicCallbacks {
         switch (cmd) {
             case 'T':                       // 对时
                 applyEpoch(arg);
+                break;
+            case 'V':                       // V2：切换到二进制帧协议
+                if (arg == 2) {
+                    protoV2 = true;
+                    helloPending = true;
+                    Serial.println("[PROTO] 切到 v2 二进制帧");
+                }
                 break;
             case 'P':                       // ping：回一段当前状态
                 Serial.printf("[BLE] pong, uptime=%lus\n", (unsigned long)(millis() / 1000));
@@ -1218,6 +1234,7 @@ void setup() {
 
     Serial.println();
     Serial.println("=== watch_lvgl: LVGL9 PARTIAL + 25Hz 采样 ===");
+    fframe_selftest();
     Serial.printf("[LVGL] 版本 %d.%d.%d\n", lv_version_major(), lv_version_minor(), lv_version_patch());
 
     i2cMutex = xSemaphoreCreateMutex();
@@ -1426,6 +1443,15 @@ void loop() {
                       (unsigned long)uiFrames);
 
         flushCnt = 0; flushSumUs = 0; flushMaxUs = 0; flushPx = 0;
+    }
+
+    if (helloPending && bleConnected && pNotify && millis() - bleConnectedAt > 300) {
+        helloPending = false;
+        uint8_t f[FFRAME_SIZE];
+        fframe_encode_hello(f, FFRAME_VER, 1, 0);   // proto=2, fw 1.0
+        pNotify->setValue(f, FFRAME_SIZE);
+        pNotify->notify();
+        Serial.println("[PROTO] 已回 HELLO(proto=2 fw=1.0)");
     }
 
     ringDrain();
