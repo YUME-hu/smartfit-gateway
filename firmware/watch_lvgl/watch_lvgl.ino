@@ -731,13 +731,35 @@ static void blogTick() {
     if (now - lastBlogMs < period) return;
     lastBlogMs = now;
 
-    if (blogCache.length() > 3000) blogCache = "";     // 防止 NVS 字符串无限增长
+    if (blogCache.length() > 3500) {                   // 超长时只丢最旧的，保留近期数据
+        const int cut = blogCache.indexOf(",", blogCache.length() - 1500);
+        blogCache = (cut > 0) ? blogCache.substring(cut + 1) : "";
+    }
 
     char line[20];
     snprintf(line, sizeof(line), "%u:%d,", (unsigned)(now / 60000UL), (int)battMv);
     blogCache += line;
     prefs.putString("blog", blogCache);
     Serial.printf("[BLOG] %s\n", line);                // 插着 USB 时也能看到
+}
+
+// 逐条一行打印：整串一行打会被 [WIN] 之类的周期性输出从中间切断，抓不全
+static uint32_t lastBlogDumpMs = 0;
+static void blogDumpTick() {
+    if (blogCache.length() == 0) return;
+    if (millis() - lastBlogDumpMs < 60000) return;
+    lastBlogDumpMs = millis();
+    Serial.printf("[BLOGD] %u\n", (unsigned)blogCache.length());
+    int start = 0;
+    while (start < (int)blogCache.length()) {
+        int comma = blogCache.indexOf(',', start);
+        if (comma < 0) break;
+        Serial.print("[BLOGD] ");
+        Serial.println(blogCache.substring(start, comma));
+        start = comma + 1;
+        delay(2);                       // 让出串口，避免整段塞爆 TX 缓冲
+    }
+    Serial.println("[BLOGD] END");
 }
 // ---------------------------------------------------------------- 抬腕亮屏
 // 标定结论（2026-11-22）：手臂下垂时 pitch ≈ 18-22°，抬到眼前 ≈ 76-80°，
@@ -1510,6 +1532,7 @@ void loop() {
         if (vbusIn && !wasVbus && !screenOn) wakeRequest = true;
 
         blogTick();
+        blogDumpTick();
     }
 
     if (now - winStart >= WINDOW_MS) {
