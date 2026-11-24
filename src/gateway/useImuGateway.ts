@@ -111,10 +111,14 @@ export function useImuGateway(config: GatewayConfig) {
         supportsWrite.value = transport.supportsWrite
         if (!transport.supportsWrite) {
           lastError.value = '未找到可写特征（FFF2）：指令通道不可用，对时与 ACK 都不会生效'
+          return
         }
-        void syncDeviceTime()
-        // 声明支持 v2；老固件会忽略它并继续发文本，App 侧靠 magic 自动降级
-        void transport.writeCommand('V2')
+        // 连接刚建立时 Android 的 GATT 往往还没就绪，直接写会被拒；等 600ms 再发。
+        // 'V2' 是协议声明：老固件会忽略它并继续发文本，App 侧靠首字节 magic 自动降级。
+        setTimeout(() => {
+          void transport.writeCommand('V2')
+          void syncDeviceTime()
+        }, 600)
       }
     },
     onPacket: (text) => {
@@ -248,7 +252,7 @@ export function useImuGateway(config: GatewayConfig) {
       lastTimeSync.value = Date.now()
       console.log('[gateway] 对时成功 T' + epoch)
     } else {
-      lastError.value = '对时写入失败：写特征不可用或被系统拒绝'
+      lastError.value = '对时写入失败：' + (transport.writeError ?? '未知原因')
       console.warn('[gateway] 对时失败')
     }
   }

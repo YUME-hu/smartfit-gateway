@@ -222,6 +222,7 @@ export class UniBleTransport {
   private deviceId: string | null = null
   private charId: string | null = null
   private writeCharId: string | null = null
+  private lastWriteError: string | null = null
   private serviceId: string | null = null
   private stopped = true
   private connecting = false
@@ -356,14 +357,28 @@ export class UniBleTransport {
    * 刻意不抛异常：指令通道是**可选能力**，它失败不能中断主链路采集。
    */
   async writeCommand(cmd: string): Promise<boolean> {
-    if (!this.deviceId || !this.writeCharId || !this.serviceId) return false
-    try {
-      await pWrite(this.deviceId, this.serviceId, this.writeCharId, asciiToBuffer(cmd))
-      return true
-    } catch (e) {
-      console.warn('[ble] 写指令失败：' + (e instanceof Error ? e.message : String(e)))
+    if (!this.deviceId || !this.writeCharId || !this.serviceId) {
+      this.lastWriteError = "没有可写特征（writeCharId/serviceId 为空）"
       return false
     }
+    // 连接刚建立时 Android 常直接拒绝 GATT 写（write busy / 状态未就绪），重试三次
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await pWrite(this.deviceId, this.serviceId, this.writeCharId, asciiToBuffer(cmd))
+        this.lastWriteError = null
+        return true
+      } catch (e) {
+        this.lastWriteError = e instanceof Error ? e.message : String(e)
+        console.warn(`[ble] 写指令失败（第 ${attempt + 1} 次）：` + this.lastWriteError)
+        await new Promise((r) => setTimeout(r, 250))
+      }
+    }
+    return false
+  }
+
+  /** 最近一次写失败的原因（平台原文），用于界面显示 */
+  get writeError(): string | null {
+    return this.lastWriteError
   }
 
   /** 发送二进制数据（协议 v2 的 ACK 帧） */
@@ -377,7 +392,8 @@ export class UniBleTransport {
       await pWrite(this.deviceId, this.serviceId, this.writeCharId, buf)
       return true
     } catch (e) {
-      console.warn('[ble] 写二进制失败：' + (e instanceof Error ? e.message : String(e)))
+      this.lastWriteError = e instanceof Error ? e.message : String(e)
+      console.warn('[ble] 写二进制失败：' + this.lastWriteError)
       return false
     }
   }
