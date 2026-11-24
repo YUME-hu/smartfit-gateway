@@ -37,6 +37,8 @@ export function useImuGateway(config: GatewayConfig) {
   const timeSyncOk = ref(false)
   /** 手表报了 HELLO 才认为走 v2；否则一直用文本解析（自动降级） */
   const protoVersion = ref(0)
+  /** 已发出的 ACK 数（用于确认 ACK 通道真的在工作） */
+  const acksSent = ref(0)
 
   /** 本地待上传条数 */
   const pending = ref(0)
@@ -181,8 +183,9 @@ export function useImuGateway(config: GatewayConfig) {
       }
       latest.publish(sample)
 
-      // 回 ACK：让固件知道这一帧真的到了（M3 的重传依据）
-      void transport.writeBytes(encodeAck(f.seq))
+      // 回 ACK：不让它在通知回调里直接写 —— Android 在 BLE 回调内发起 GATT 写
+      // 经常被拒（write busy）或静默失败，表现就是"手表一直重传、App 却看不出问题"。
+      queueAck(f.seq)
     },
   })
 
@@ -198,6 +201,28 @@ export function useImuGateway(config: GatewayConfig) {
     engine.start()
     transport.start()
     uni.onNetworkStatusChange(onNetworkChange)
+  }
+
+  // ---- ACK 发送队列（放在 BLE 回调之外写，见 onFrame 里的说明）
+  let ackQueue: number[] = []
+  let ackTimer: ReturnType<typeof setTimeout> | null = null
+
+  function queueAck(seq: number): void {
+    ackQueue.push(seq)
+    if (ackQueue.length > 16) ackQueue.shift() // 积压时丢最旧的，避免越拖越长
+    if (ackTimer === null) ackTimer = setTimeout(() => void flushAcks(), 40)
+  }
+
+  async function flushAcks(): Promise<void> {
+    ackTimer = null
+    const batch = ackQueue
+    ackQueue = []
+    for (const seq of batch) {
+      let ok = await transport.writeBytes(encodeAck(seq))
+      if (!ok) ok = await transport.writeBytes(encodeAck(seq)) // 失败重试一次
+      if (ok) acksSent.value++
+      else console.warn('[gateway] ACK 写失败 seq=' + seq)
+    }
   }
 
   /**
@@ -272,6 +297,7 @@ export function useImuGateway(config: GatewayConfig) {
     lastTimeSync,
     timeSyncOk,
     protoVersion,
+    acksSent,
     // 动作
     start,
     stop,
