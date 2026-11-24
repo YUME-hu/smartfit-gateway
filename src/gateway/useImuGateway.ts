@@ -39,6 +39,8 @@ export function useImuGateway(config: GatewayConfig) {
   const protoVersion = ref(0)
   /** 已发出的 ACK 数（用于确认 ACK 通道真的在工作） */
   const acksSent = ref(0)
+  const supportsWrite = ref(false)
+  let acksFailed = 0
 
   /** 本地待上传条数 */
   const pending = ref(0)
@@ -106,6 +108,10 @@ export function useImuGateway(config: GatewayConfig) {
       statusDetail.value = detail ?? ''
       connected.value = s === 'connected'
       if (s === 'connected') {
+        supportsWrite.value = transport.supportsWrite
+        if (!transport.supportsWrite) {
+          lastError.value = '未找到可写特征（FFF2）：指令通道不可用，对时与 ACK 都不会生效'
+        }
         void syncDeviceTime()
         // 声明支持 v2；老固件会忽略它并继续发文本，App 侧靠 magic 自动降级
         void transport.writeCommand('V2')
@@ -221,7 +227,11 @@ export function useImuGateway(config: GatewayConfig) {
       let ok = await transport.writeBytes(encodeAck(seq))
       if (!ok) ok = await transport.writeBytes(encodeAck(seq)) // 失败重试一次
       if (ok) acksSent.value++
-      else console.warn('[gateway] ACK 写失败 seq=' + seq)
+      else {
+        acksFailed++
+        if (acksFailed === 1) lastError.value = 'ACK 写入失败：确认链路质量或写特征'
+        console.warn('[gateway] ACK 写失败 seq=' + seq)
+      }
     }
   }
 
@@ -238,7 +248,8 @@ export function useImuGateway(config: GatewayConfig) {
       lastTimeSync.value = Date.now()
       console.log('[gateway] 对时成功 T' + epoch)
     } else {
-      console.warn('[gateway] 对时失败：固件可能没有 FFF2 写特征（非致命）')
+      lastError.value = '对时写入失败：写特征不可用或被系统拒绝'
+      console.warn('[gateway] 对时失败')
     }
   }
 
@@ -298,6 +309,7 @@ export function useImuGateway(config: GatewayConfig) {
     timeSyncOk,
     protoVersion,
     acksSent,
+    supportsWrite,
     // 动作
     start,
     stop,

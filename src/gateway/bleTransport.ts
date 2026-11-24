@@ -138,12 +138,22 @@ function pGetServices(deviceId: string): Promise<Array<{ uuid: string }>> {
 function pGetCharacteristics(
   deviceId: string,
   serviceId: string,
-): Promise<Array<{ uuid: string; properties: { notify?: boolean; indicate?: boolean } }>> {
+): Promise<
+  Array<{
+    uuid: string
+    properties: { notify?: boolean; indicate?: boolean; write?: boolean; writeNoResponse?: boolean }
+  }>
+> {
   return new Promise((resolve, reject) => {
     uni.getBLEDeviceCharacteristics({
       deviceId,
       serviceId,
-      success: (res: { characteristics: Array<{ uuid: string; properties: { notify?: boolean; indicate?: boolean } }> }) =>
+      success: (res: {
+        characteristics: Array<{
+          uuid: string
+          properties: { notify?: boolean; indicate?: boolean; write?: boolean; writeNoResponse?: boolean }
+        }>
+      }) =>
         resolve(res.characteristics || []),
       fail: (e: { errMsg?: string }) => reject(new Error(e?.errMsg || 'getBLEDeviceCharacteristics 失败')),
     })
@@ -313,8 +323,21 @@ export class UniBleTransport {
         this.opts.writeCharUuid ?? '0000FFF2-0000-1000-8000-00805F9B34FB',
       )
       const w = chars.find((c) => normalizeUuid(c.uuid) === wantedWrite)
-      this.writeCharId = w ? w.uuid : null
-      if (!w) console.warn('[ble] 未找到写特征 FFF2：指令通道不可用（对时会降级）')
+      // 兜底：真机上有平台会把特征 UUID 报成别的形式（或厂商改名），
+      // 这时按"谁能写"来挑，总比整条指令通道失效好。
+      const anyWrite = chars.find(
+        (c) =>
+          (c.properties as { write?: boolean; writeNoResponse?: boolean }).write === true ||
+          (c.properties as { writeNoResponse?: boolean }).writeNoResponse === true,
+      )
+      const chosen = w ?? anyWrite
+      this.writeCharId = chosen ? chosen.uuid : null
+      if (!w && anyWrite) {
+        console.warn('[ble] 未匹配到 FFF2，按"可写属性"兜底选了 ' + anyWrite.uuid)
+      }
+      if (!w && !anyWrite) {
+        console.warn('[ble] 该服务下没有任何可写特征：指令通道不可用')
+      }
 
       this.reconnectAttempt = 0
       this.opts.onStatus('connected', this.opts.deviceName)
