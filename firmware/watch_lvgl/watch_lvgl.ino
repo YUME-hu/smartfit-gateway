@@ -32,6 +32,10 @@
 LV_FONT_DECLARE(cjk16);
 #include "Arduino_DriveBus_Library.h"
 #include "frame.h"
+#include "ESP_I2S.h"
+#include "es8311.h"
+
+static I2SClass i2s;
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -51,6 +55,7 @@ LV_FONT_DECLARE(cjk16);
 #define OPT_CPU_SLOW_SLEEP 1     // 息屏时 CPU 240MHz → 80MHz
 #define CPU_ACTIVE_MHZ   240
 #define CPU_IDLE_MHZ     80
+#define AUD_VOLUME       70      // ES8311 播放音量 0-100
 
 // ---------------------------------------------------------------- 全局
 static Arduino_DataBus *bus = nullptr;
@@ -154,6 +159,9 @@ static uint32_t rpTWin = 0, rpTStable = 0;
 static volatile bool  wakeRequest = false;
 static volatile bool  redrawRequest = false;
 static uint32_t lastAttPrint = 0;
+// 达标提示音状态（采样任务只置标志，由 loop 负责真的发声）
+static volatile bool goalBeeped = false;
+static volatile bool goalBeepReq = false;
 static Preferences prefs;
 
 static void openSub(int i);
@@ -221,7 +229,13 @@ static void samplerTask(void *) {
         if (ok) {
             winSamples++;
             totalSamples++;
-            if (stepCounter.feed(x, y, z, millis())) lifetimeSteps++;
+            if (stepCounter.feed(x, y, z, millis())) {
+            lifetimeSteps++;
+            if (!goalBeeped && goalSteps > 0 && lifetimeSteps >= (uint32_t)goalSteps) {
+                goalBeeped = true;
+                goalBeepReq = true;     // 交给 loop 里响，采样任务里不做阻塞 I/O
+            }
+        }
 
             // 姿态（低通后算俯仰/横滚），给抬腕检测用
             static float lx = 0, ly = 0, lz = 0;
@@ -270,6 +284,9 @@ static uint8_t  inflightTries = 0;
 static volatile uint16_t ackSeqRecv = 0;
 static volatile bool     ackPending = false;
 static uint32_t rtRetransmit = 0, rtGiveUp = 0, rtAcked = 0;
+
+// 前向声明：BLE 回调里要用到 beep（定义在后面）
+static void beep(uint16_t freqHz, uint16_t ms, uint8_t vol, int forcePa);
 static uint32_t badWriteCount = 0;
 
 // ---------------------------------------------------------------- 延迟测量（M4 实验 E2）
@@ -592,10 +609,10 @@ class WriteCb : public BLECharacteristicCallbacks {
         v.trim();
         Serial.printf("[BLE] 收到指令 (%u B): \"%s\"\n", (unsigned)v.length(), v.c_str());
         markActivity();
-        if (v.length() < 2) return;
+        if (v.length() < 1) return;   // 无参数指令（如 S）长度只有 1
 
         const char cmd = v[0];
-        const uint32_t arg = (uint32_t)strtoul(v.c_str() + 1, nullptr, 10);
+        const uint32_t arg = (v.length() >= 2) ? (uint32_t)strtoul(v.c_str() + 1, nullptr, 10) : 0u;
         switch (cmd) {
             case 'T':                       // 对时
                 applyEpoch(arg);
@@ -606,6 +623,14 @@ class WriteCb : public BLECharacteristicCallbacks {
                     helloPending = true;
                     Serial.println("[PROTO] 切到 v2 二进制帧");
                 }
+                break;
+            case 'S':                       // 测试提示音（PA 强制 HIGH）
+                beep(880, 300, AUD_VOLUME, 1);
+                Serial.println("[AUD ] 测试音 PA=HIGH");
+                break;
+            case 'L':                       // 测试提示音（PA 强制 LOW）
+                beep(880, 300, AUD_VOLUME, 0);
+                Serial.println("[AUD ] 测试音 PA=LOW");
                 break;
             case 'P':                       // ping：回一段当前状态
                 Serial.printf("[BLE] pong, uptime=%lus\n", (unsigned long)(millis() / 1000));
@@ -800,6 +825,77 @@ static void screenWake(const char *why) {
 
 static void markActivity() { lastActivityMs = millis(); }
 
+// ---------------------------------------------------------------- M6 音频（ES8311）
+// 引脚（台账 §8，与官方例程 08 一致）：BCLK 41 / WS 45 / DOUT 40 / DIN 42 / MCLK 16；
+// 功放使能 GPIO46；编解码器 I2C 地址 0x18（与 Wire 共用总线，es8311.c 用的是 Arduino i2cWrite）。
+#define AUD_SR        16000
+#define AUD_PA_PIN    46
+
+static bool audioOk = false;
+static es8311_handle_t esHandle = nullptr;
+static uint32_t beepCount = 0;
+
+static void audioInit() {
+    i2s.setPins(41, 45, 40, 42, 16);          // BCLK / WS / DOUT / DIN / MCLK
+    if (!i2s.begin(I2S_MODE_STD, AUD_SR, I2S_DATA_BIT_WIDTH_16BIT,
+                   I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
+        Serial.println("[AUD ] I2S 初始化失败");
+        return;
+    }
+
+    pinMode(AUD_PA_PIN, OUTPUT);
+    digitalWrite(AUD_PA_PIN, LOW);            // 平时关功放：常开会把底噪一直放大成"嗡嗡声"
+
+    esHandle = es8311_create(0, ES8311_ADDRRES_0);
+    if (!esHandle) { Serial.println("[AUD ] ES8311 create 失败"); return; }
+
+    const es8311_clock_config_t clk = { false, false, true,
+                                        AUD_SR * 256, AUD_SR };
+    esp_err_t e1 = es8311_init(esHandle, &clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
+    if (e1 != ESP_OK) { Serial.printf("[AUD ] es8311_init 失败 %d\n", (int)e1); return; }
+    es8311_sample_frequency_config(esHandle, AUD_SR * 256, AUD_SR);
+    es8311_voice_volume_set(esHandle, AUD_VOLUME, nullptr);
+    es8311_voice_mute(esHandle, false);              // 显式解除静音
+    int volRead = -1;
+    es8311_voice_volume_get(esHandle, &volRead);
+    Serial.printf("[AUD ] 音量回读 %d（设置值 %d）\n", volRead, AUD_VOLUME);
+
+    audioOk = true;
+    Serial.printf("[AUD ] ES8311 OK  采样 %d Hz  音量 %d%%\n", AUD_SR, AUD_VOLUME);
+}
+
+/** 播放一段正弦提示音（阻塞 ms 毫秒；调用点都在"事件发生"时，不影响采样任务） */
+static void beep(uint16_t freqHz, uint16_t ms, uint8_t vol, int forcePa = -1) {
+    if (!audioOk) return;
+    const int total = (AUD_SR * (int)ms) / 1000;
+    int16_t buf[256];                          // 128 帧 × 2 声道
+    const float dp = 2.0f * 3.14159265f * (float)freqHz / (float)AUD_SR;
+    float phase = 0;
+    int done = 0;
+    beepCount++;
+    // 实测：GPIO46 高低都能出声（功放默认开），这里只保留"发声期间拉高"的习惯写法
+    const bool paHigh = (forcePa < 0) ? true : (forcePa != 0);
+    digitalWrite(AUD_PA_PIN, paHigh ? HIGH : LOW);
+
+    while (done < total) {
+        int n = total - done;
+        if (n > 128) n = 128;
+        for (int i = 0; i < n; i++) {
+            int16_t s = (int16_t)(sinf(phase) * (float)vol * 100.0f);
+            buf[i * 2] = s;
+            buf[i * 2 + 1] = s;
+            phase += dp;
+            if (phase > 6.2831853f) phase -= 6.2831853f;
+        }
+        size_t w = i2s.write((uint8_t *)buf, (size_t)n * 4);
+        (void)w;
+        done += n;
+    }
+    // 补一小段静音再关功放，避免尾部"咔"的一声
+    memset(buf, 0, sizeof(buf));
+    for (int k = 0; k < 4; k++) i2s.write((uint8_t *)buf, sizeof(buf));
+    digitalWrite(AUD_PA_PIN, LOW);
+}
 // ---------------------------------------------------------------- 电量日志（放电实验）
 // 断 USB 后没法往串口打日志，所以把 mV 写进 NVS：电池耗尽重启后仍能读出整条曲线。
 // 5 分钟一条；低于 10% 改 1 分钟一条，为了抓到末尾那段陡降。
@@ -1581,10 +1677,11 @@ void setup() {
 
     blogCache = prefs.getString("blog");
     if (blogCache.length() > 0) {
-        Serial.printf("[BLOG] 上次运行的电量记录（%u 字节）：\n%s\n", (unsigned)blogCache.length(), blogCache.c_str());
+        Serial.printf("[BLOG] 上次运行的电量记录 %u 条（每分钟会逐条打印）\n", (unsigned)blogCache.length());
     }
 
     ringInit();
+    audioInit();
     initBle();
 
     xTaskCreatePinnedToCore(samplerTask, "sampler", 4096, nullptr, 5, nullptr, 1);
@@ -1668,6 +1765,13 @@ void loop() {
         pNotify->setValue(f, FFRAME_SIZE);
         pNotify->notify();
         Serial.println("[PROTO] 已回 HELLO(proto=2 fw=1.0)");
+    }
+
+    if (goalBeepReq) {
+        goalBeepReq = false;
+        Serial.println("[AUD ] 步数达标提示音");
+        beep(880, 120, AUD_VOLUME);
+        beep(1320, 180, AUD_VOLUME);
     }
 
     ringDrain();
