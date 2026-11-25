@@ -16,6 +16,8 @@ import LiveChart from './components/LiveChart.vue'
 import SquatView from './features/squat/SquatView.vue'
 import PetView from './features/pet/PetView.vue'
 import { useDeviceLatest } from './composables/useDeviceLatest'
+import { useLinkHealth } from './composables/useLinkHealth'
+import LinkHealth from './components/LinkHealth.vue'
 
 /** 顶部 Tab：实时数据 / 深蹲识别 / 我的宠物（不引 vue-router，减少一层依赖） */
 const tab = ref<'data' | 'squat' | 'pet'>('data')
@@ -30,6 +32,17 @@ if (!supabaseUrl) missing.push('VITE_SUPABASE_URL')
 if (!supabaseKey) missing.push('VITE_SUPABASE_ANON_KEY')
 
 const { latest, points, status, error, sessionSteps, lastAt, reconnect } = useDeviceLatest({
+  supabaseUrl: supabaseUrl ?? 'https://placeholder.supabase.co',
+  supabaseAnonKey: supabaseKey ?? 'placeholder',
+  deviceId,
+  enabled: missing.length === 0,
+})
+
+// M5：链路健康（用 imu_samples 统计到达率 / 时钟偏差，跟实时曲线互补）
+const {
+  snapshot: linkHealth,
+  loading: linkLoading,
+} = useLinkHealth({
   supabaseUrl: supabaseUrl ?? 'https://placeholder.supabase.co',
   supabaseAnonKey: supabaseKey ?? 'placeholder',
   deviceId,
@@ -128,12 +141,14 @@ const stale = computed(() => lastAt.value > 0 && Date.now() - lastAt.value > 150
       </article>
     </section>
 
+    <!-- M5：链路健康（到达率 / 时钟偏差 / 新鲜度） -->
+    <LinkHealth :snapshot="linkHealth" :loading="linkLoading" />
+
     <section class="card">
       <div class="card-head">
         <h2>加速度与步数（5 分钟滚动窗口）</h2>
         <span class="hint">每 5 秒一包 · ECharts</span>
-      </div>
-      <div class="chart-wrap">
+      </div>      <div class="chart-wrap">
         <LiveChart :points="points" />
         <div v-if="points.length === 0" class="empty">
           <p>等待数据…</p>
