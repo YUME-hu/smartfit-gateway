@@ -45,6 +45,12 @@ LV_FONT_DECLARE(cjk16);
 #define STEP_TARGET      8000    // 步数目标（进度用，M2 可由手机下发）
 #define CAL_SCREEN       0       // 1 = 开机先显示校准图案（排查色序/可见区用）
 #define ATT_LOG          0       // 1 = 以 10Hz 打印姿态（标定用；平时 0）
+// ---- M4b 功耗优化开关（可逐项关掉做 A/B 对比）
+#define OPT_BLE_SLOW_ADV 1       // 广播间隔 20ms → 1s
+#define OPT_BLE_STOP_ON_CONNECT 1 // 连上就停广播
+#define OPT_CPU_SLOW_SLEEP 1     // 息屏时 CPU 240MHz → 80MHz
+#define CPU_ACTIVE_MHZ   240
+#define CPU_IDLE_MHZ     80
 
 // ---------------------------------------------------------------- 全局
 static Arduino_DataBus *bus = nullptr;
@@ -264,12 +270,63 @@ static uint8_t  inflightTries = 0;
 static volatile uint16_t ackSeqRecv = 0;
 static volatile bool     ackPending = false;
 static uint32_t rtRetransmit = 0, rtGiveUp = 0, rtAcked = 0;
+static uint32_t badWriteCount = 0;
+
+// ---------------------------------------------------------------- 延迟测量（M4 实验 E2）
+// 用 ACK 的往返时间（RTT）衡量端到端延迟：手表发出帧 → 手机收到 → 手机回 ACK → 手表收到。
+// 选 RTT 而不是"单向传输时间"，是因为两端时钟不同步，单向时间必须先对时到毫秒级，
+// 而 RTT 只在手表自己的时钟域里算，不需要任何同步假设。
+#define LAT_CAP 256
+static uint16_t latBuf[LAT_CAP];
+static uint16_t latCount = 0;      // 已记录条数（环形覆盖）
+static uint16_t latHead = 0;
+static uint32_t sentAtMs = 0;      // 当前在途帧的发送时刻
+static uint32_t lastLatPrint = 0;
+static uint32_t ackRxCount = 0;      // 收到过多少个合法 ACK
+
+static void latRecord(uint32_t rttMs) {
+    latBuf[latHead] = (uint16_t)(rttMs > 65535 ? 65535 : rttMs);
+    latHead = (latHead + 1) % LAT_CAP;
+    if (latCount < LAT_CAP) latCount++;
+}
+
+static int latCmp(const void *a, const void *b) {
+    const uint16_t x = *(const uint16_t *)a, y = *(const uint16_t *)b;
+    return (x > y) - (x < y);
+}
+
+static void latPrint() {
+    if (latCount == 0) {
+        Serial.printf("[LAT ] 还没有样本（ACK收到=%lu 重传=%lu 放弃=%lu）—— 手机是否连上并回了 ACK？\n",
+                      (unsigned long)ackRxCount, (unsigned long)rtRetransmit, (unsigned long)rtGiveUp);
+        return;
+    }
+    uint16_t tmp[LAT_CAP];
+    const uint16_t n = latCount;
+    for (uint16_t i = 0; i < n; i++) tmp[i] = latBuf[i];
+    qsort(tmp, n, sizeof(uint16_t), latCmp);
+
+    const uint16_t p50 = tmp[(n * 50) / 100];
+    const uint16_t p95 = tmp[(n * 95) / 100 >= n ? n - 1 : (n * 95) / 100];
+    uint32_t sum = 0;
+    for (uint16_t i = 0; i < n; i++) sum += tmp[i];
+
+    Serial.printf("[LAT ] n=%u p50=%ums p95=%ums max=%ums avg=%lums | ACK收到=%lu 重传=%lu 放弃=%lu\n",
+                  (unsigned)n, (unsigned)p50, (unsigned)p95,
+                  (unsigned)tmp[n - 1], (unsigned long)(sum / n),
+                  (unsigned long)ackRxCount, (unsigned long)rtRetransmit, (unsigned long)rtGiveUp);
+}
+
 static uint32_t           notifSent = 0;
 
 class SrvCb : public BLEServerCallbacks {
     void onConnect(BLEServer *) override {
         bleConnected = true;
         bleConnectedAt = millis();
+#if OPT_BLE_STOP_ON_CONNECT
+        BLEDevice::getAdvertising()->stop();   // 连上就不需要被发现了
+        Serial.println("[PWR ] 已停广播（连接中）");
+#endif
         markActivity();
         Serial.println("[BLE] 主机已连接");
     }
@@ -434,6 +491,7 @@ static void ringDrain() {
 
     inflight = true;
     inflightAt = millis();
+    sentAtMs = inflightAt;
     inflightTries++;
 
     if (!protoV2) {                                    // 文本模式：无 ACK 可等
@@ -515,10 +573,19 @@ class WriteCb : public BLECharacteristicCallbacks {
         const size_t len = c->getLength();
         if (len == FFRAME_SIZE && raw && raw[0] == FFRAME_MAGIC) {
             if (fframe_valid(raw, len) && raw[2] == FFRAME_TYPE_ACK) {
+                ackRxCount++;
+                if (inflight) latRecord(millis() - sentAtMs);
                 ackSeqRecv = fframe_get_u16(raw, 3);
                 ackPending = true;
+            } else if (badWriteCount++ % 20 == 0) {
+                Serial.printf("[BLE] 收到非法二进制写入 len=%u magic=%02x（应回 ACK 却不像 ACK）\n",
+                              (unsigned)len, (unsigned)raw[0]);
             }
             return;
+        }
+        if (badWriteCount < 3) {
+            badWriteCount++;
+            Serial.printf("[BLE] 收到非帧、非文本写入 len=%u\n", (unsigned)len);
         }
 
         String v = c->getValue();
@@ -576,6 +643,13 @@ static void initBle() {
     adv->setScanResponse(true);
     adv->setMinPreferred(0x06);
     adv->setMinPreferred(0x12);
+#if OPT_BLE_SLOW_ADV
+    // 默认广播间隔 20ms，占空比高、常驻耗电。放宽到 1s 后手机仍能在十几秒内发现，
+    // 但广播平均电流下降一个数量级。单位 0.625ms → 1600 = 1000ms。
+    adv->setMinInterval(1600);
+    adv->setMaxInterval(1600);
+    Serial.println("[PWR ] 广播间隔 → 1000ms");
+#endif
     BLEDevice::startAdvertising();
     Serial.println("[BLE] 广播中：ESP32_Fitness_Watch（FFF1 上报 / FFF2 指令）");
 }
@@ -692,6 +766,10 @@ static lv_obj_t *mkText(lv_obj_t *parent, const lv_font_t *font, lv_color_t colo
 static const int TO_SEC[5] = {0, 15, 30, 60, 120};
 
 static void screenOff() {
+#if OPT_CPU_SLOW_SLEEP
+    setCpuFrequencyMhz(CPU_IDLE_MHZ);
+    Serial.printf("[PWR ] 息屏降频 → %u MHz\n", (unsigned)getCpuFrequencyMhz());
+#endif
     if (!screenOn) return;
     screenOn = false;
     rpWinStart = attPitch;
@@ -703,6 +781,10 @@ static void screenOff() {
 }
 
 static void screenWake(const char *why) {
+#if OPT_CPU_SLOW_SLEEP
+    setCpuFrequencyMhz(CPU_ACTIVE_MHZ);
+    Serial.printf("[PWR ] 唤醒升频 → %u MHz\n", (unsigned)getCpuFrequencyMhz());
+#endif
     if (screenOn) return;
     screenOn = true;
     if (gfx) {
@@ -1249,7 +1331,7 @@ static void uiTask(void *) {
             } else {
                 raiseTick();
                 if (!screenOn) {
-                    vTaskDelay(pdMS_TO_TICKS(50));
+                    vTaskDelay(pdMS_TO_TICKS(200));   // 息屏时放慢轮询
                     continue;
                 }
             }
@@ -1533,6 +1615,11 @@ void loop() {
 
         blogTick();
         blogDumpTick();
+
+        if (millis() - lastLatPrint >= 60000) {
+            lastLatPrint = millis();
+            latPrint();
+        }
     }
 
     if (now - winStart >= WINDOW_MS) {
