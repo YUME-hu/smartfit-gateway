@@ -26,6 +26,20 @@ export interface LinkHealthSnapshot {
   clockSkewMs: number | null
   /** 带 device_ts 的行占比 */
   deviceTsRatio: number | null
+  /**
+   * 按 2 分钟分桶的到达情况（30 桶 = 60 分钟）。
+   * 用来把"哪段时间是空的"画出来 —— 汇总到达率看不出空洞发生在什么时候。
+   */
+  buckets: Bucket[]
+}
+
+export interface Bucket {
+  /** 桶起点（epoch ms） */
+  t: number
+  /** 该桶内实际行数 */
+  rows: number
+  /** 该桶期望行数（桶长 / 5s） */
+  expected: number
 }
 
 export function useLinkHealth(opts: {
@@ -49,6 +63,24 @@ export function useLinkHealth(opts: {
     const s = [...xs].sort((a, b) => a - b)
     const mid = Math.floor(s.length / 2)
     return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2
+  }
+
+  const BUCKET_MS = 2 * 60_000
+
+  /** 以"现在"为右端点，向前切 30 个 2 分钟桶 */
+  function buildBuckets(times: number[]): Bucket[] {
+    const end = Date.now()
+    const total = Math.floor((windowMinutes * 60_000) / BUCKET_MS)
+    const out: Bucket[] = []
+    for (let i = 0; i < total; i++) {
+      const t = end - (total - i) * BUCKET_MS
+      out.push({ t, rows: 0, expected: BUCKET_MS / 5000 })
+    }
+    for (const ts of times) {
+      const idx = total - 1 - Math.floor((end - ts) / BUCKET_MS)
+      if (idx >= 0 && idx < total) out[idx].rows++
+    }
+    return out
   }
 
   async function refresh(): Promise<void> {
@@ -76,10 +108,11 @@ export function useLinkHealth(opts: {
       snapshot.value = {
         lastSampleAt: 0,
         rows: 0,
-        expected: (windowMinutes * 60) / 5,
+        expected: 0,
         arrivalRate: null,
         clockSkewMs: null,
         deviceTsRatio: null,
+        buckets: buildBuckets([]),
       }
       return
     }
@@ -108,6 +141,7 @@ export function useLinkHealth(opts: {
       arrivalRate: rows.length / expected,
       clockSkewMs: median(skews),
       deviceTsRatio: rows.length ? withTs / rows.length : null,
+      buckets: buildBuckets(times),
     }
   }
 
