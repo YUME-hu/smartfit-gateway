@@ -185,3 +185,62 @@ export function kneeAngleFromPose(
   if (hasRight) return { angle: rightAngle, side: 'right' }
   return { angle: null, side: null }
 }
+
+export interface ThighAngleResult {
+  /**
+   * 大腿相对**竖直向下**方向的倾角（度）。
+   * 站立时≈0，蹲到底时≈40~70（越大越深）。
+   * 侧拍时这个量非常显著，而且**不需要踝关节**。
+   */
+  angle: number | null
+  side: 'left' | 'right' | 'both' | null
+}
+
+/**
+ * 大腿倾角：踝关节出画时的降级量。
+ *
+ * 为什么需要它：膝角要 髋-膝-踝 三点，宿舍等受限空间里踝关节常常压在画面底边、
+ * 或干脆出画，于是整帧被判"取景不合格"而不计数（实测 15 个只记到 4 个）。
+ * 而侧拍时"大腿相对竖直的倾角"从 0° 变到 60°+，只用髋、膝两点就能算。
+ */
+export function thighAngleFromPose(
+  landmarks: LandmarkPoint[],
+  minVisibility = 0.3,
+): ThighAngleResult {
+  const hipKnee = (h: LandmarkPoint, k: LandmarkPoint): number => {
+    const dx = k.x - h.x
+    const dy = k.y - h.y
+    // 图像坐标 y 向下：dy > 0 表示膝在髋下方（正常站立/下蹲）
+    const deg = (Math.atan2(Math.abs(dx), Math.max(1e-6, dy)) * 180) / Math.PI
+    return Math.min(90, Math.max(0, deg))
+  }
+
+  const lh = landmarks[POSE.leftHip]
+  const lk = landmarks[POSE.leftKnee]
+  const rh = landmarks[POSE.rightHip]
+  const rk = landmarks[POSE.rightKnee]
+
+  const leftOk = visible(lh, minVisibility) && visible(lk, minVisibility)
+  const rightOk = visible(rh, minVisibility) && visible(rk, minVisibility)
+
+  const leftAngle = leftOk ? hipKnee(lh, lk) : Number.NaN
+  const rightAngle = rightOk ? hipKnee(rh, rk) : Number.NaN
+
+  const hasLeft = Number.isFinite(leftAngle)
+  const hasRight = Number.isFinite(rightAngle)
+
+  if (hasLeft && hasRight) return { angle: (leftAngle + rightAngle) / 2, side: 'both' }
+  if (hasLeft) return { angle: leftAngle, side: 'left' }
+  if (hasRight) return { angle: rightAngle, side: 'right' }
+  return { angle: null, side: null }
+}
+
+/**
+ * 把大腿倾角映射成"等效膝角"，让它能直接喂进现有的 160/100 阈值状态机：
+ *   站立 大腿 0°   → 180°（>160 ✓ 站立）
+ *   蹲底 大腿 40°  → 100°（≤100 ✓ 蹲底）
+ * 这是**近似**，只在踝关节不可用时启用，必须在使用处标注。
+ */
+export function pseudoKneeFromThigh(thighDeg: number): number {
+  return Math.max(0, Math.min(180, 180 - 2 * thighDeg))
+}

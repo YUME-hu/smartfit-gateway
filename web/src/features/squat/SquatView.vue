@@ -15,6 +15,7 @@ import type { RepEvent, SquatPhase } from './types'
 import type { SquatState } from './squatCounter'
 import { createSquatState, feedSquatAngle, phaseLabel } from './squatCounter'
 import { kneeAngleFromPose, legLooksComplete } from './poseMath'
+import { thighAngleFromPose, pseudoKneeFromThigh } from './poseMath'
 import { drawFramingGuide, drawSkeleton, framingLabel } from './drawSkeleton'
 import type { FramingState } from './drawSkeleton'
 import { usePoseLandmarker } from './usePoseLandmarker'
@@ -145,7 +146,16 @@ function loop(): void {
       // 先判定取景，再把引导框画出来（框的出处就是判定结果，人站对了会变绿）
       let legOk = false
       if (landmarks && landmarks.length) {
-        legOk = legLooksComplete(landmarks).ok
+        // 实测（宿舍环境、笔记本自带摄像头偏低）：默认阈值 minVisibility 0.5 / edgeMargin 0.02
+        // 要求踝关节离画面边缘还有 2% 余量，站得近一点踝就出画 → 完全不计数。
+        // 放宽到 0.3 / 0，并用更小的腿长跨度下限，换来"看得见髋和膝就能算"。
+        // 两级判定：
+        //   ① 髋膝踝齐全 → 用真实膝角（最准）
+        //   ② 只有髋+膝（踝出画/被遮挡）→ 用大腿倾角映射成等效膝角（降级，标注在界面上）
+        const thighProbe = thighAngleFromPose(landmarks, 0.3)
+        legOk =
+          legLooksComplete(landmarks, { minVisibility: 0.3, edgeMargin: 0, minLegSpan: 0.08 }).ok ||
+          thighProbe.angle !== null
       }
       const state: FramingState = !landmarks || !landmarks.length ? 'idle' : legOk ? 'good' : 'bad'
       drawFramingGuide(ctx, c.width, c.height, state)
@@ -165,10 +175,16 @@ function loop(): void {
           legBadSince = 0
           framingHint.value = ''
           const knee = kneeAngleFromPose(landmarks)
-          angle.value = knee.angle
-          if (knee.angle !== null) {
+          let angleForCounter: number | null = knee.angle
+          if (angleForCounter === null) {
+            // 踝关节不可用 → 降级为大腿倾角的等效膝角（近似）
+            const th = thighAngleFromPose(landmarks, 0.3)
+            if (th.angle !== null) angleForCounter = pseudoKneeFromThigh(th.angle)
+          }
+          angle.value = angleForCounter
+          if (angleForCounter !== null) {
             const t = performance.now()
-            const r = feedSquatAngle(counter, knee.angle, t)
+            const r = feedSquatAngle(counter, angleForCounter, t)
             counter = r.state
             reps.value = r.state.reps
             phase.value = r.state.phase
