@@ -1746,11 +1746,20 @@ void loop() {
         stepCounter.resetWindow();
 
         const uint32_t avgFlush = flushCnt ? flushSumUs / flushCnt : 0;
-        Serial.printf("[WIN] 采样=%lu/%lu 丢点=%.2f%% 步=%lu | %dmV %d%% | flush avg=%luus max=%luus 次=%lu px=%luK | ui帧=%lu\n",
+        char rtcBuf[12] = "--:--:--";
+        if (rtcOk && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            RTC_DateTime dt = rtc.getDateTime();
+            snprintf(rtcBuf, sizeof(rtcBuf), "%02d:%02d:%02d",
+                     dt.getHour(), dt.getMinute(), dt.getSecond());
+            xSemaphoreGive(i2cMutex);
+        }
+
+        Serial.printf("[WIN] 采样=%lu/%lu 丢点=%.2f%% 步=%lu | %dmV %d%% | rtc %s | flush avg=%luus max=%luus 次=%lu px=%luK | ui帧=%lu\n",
                       (unsigned long)got, (unsigned long)expected,
                       expected ? (100.0f * (1.0f - (float)got / expected)) : 0.0f,
                       (unsigned long)ws,
                       (int)battMv, (int)battPct,
+                      rtcBuf,
                       (unsigned long)avgFlush, (unsigned long)flushMaxUs,
                       (unsigned long)flushCnt, (unsigned long)(flushPx / 1024),
                       (unsigned long)uiFrames);
